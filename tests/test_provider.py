@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from conftest import CSRF, FakeOpenAI, install_fake_ai
+from app.providers import ALLOWED_PRESETS, ProviderConfig
 
 GO_PAYLOAD = {
     "preset": "opencode_go",
@@ -15,6 +16,19 @@ GO_PAYLOAD = {
     "image_size": "1024x1024",
 }
 SECRET = "oc_sk_test_secret_123456"
+
+
+def test_provider_supports_openrouter_claude_and_deepseek(settings):
+    assert {"openrouter", "claude", "deepseek"} <= set(ALLOWED_PRESETS)
+
+    settings.openai_base_url = "https://openrouter.ai/api/v1"
+    assert ProviderConfig.from_settings(settings).preset == "openrouter"
+
+    settings.openai_base_url = "https://api.anthropic.com/v1"
+    assert ProviderConfig.from_settings(settings).preset == "claude"
+
+    settings.openai_base_url = "https://api.deepseek.com"
+    assert ProviderConfig.from_settings(settings).preset == "deepseek"
 
 
 def test_provider_starts_from_environment(app, auth_client):

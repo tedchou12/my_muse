@@ -25,7 +25,15 @@ from .config import Settings
 from .db import Database, now_ts
 
 STORE_KEY = "provider_config"
-ALLOWED_PRESETS = ("openai", "opencode_go", "opencode_console", "custom")
+ALLOWED_PRESETS = (
+    "openai",
+    "openrouter",
+    "claude",
+    "deepseek",
+    "opencode_go",
+    "opencode_console",
+    "custom",
+)
 
 
 @dataclass(frozen=True)
@@ -47,7 +55,13 @@ class ProviderConfig:
     @classmethod
     def from_settings(cls, settings: Settings) -> "ProviderConfig":
         base = settings.openai_base_url or ""
-        if "opencode.ai/inference/go" in base:
+        if "openrouter.ai" in base:
+            preset = "openrouter"
+        elif "api.anthropic.com" in base:
+            preset = "claude"
+        elif "api.deepseek.com" in base:
+            preset = "deepseek"
+        elif "opencode.ai/inference/go" in base:
             preset = "opencode_go"
         elif "opencode.ai/inference" in base:
             preset = "opencode_console"

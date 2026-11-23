@@ -3102,6 +3102,33 @@ const PROVIDER_PRESETS = {
     user_agent: "Muse/0.1.0",
     image_model: "gpt-image-1",
   },
+  openrouter: {
+    label: "OpenRouter",
+    hint:
+      "OpenRouter gateway. Use an OpenRouter model slug that supports tool calling.",
+    base_url: "https://openrouter.ai/api/v1",
+    text_model: "openai/gpt-4o-mini",
+    session_header: "",
+    user_agent: "Muse/0.1.0",
+  },
+  claude: {
+    label: "Claude",
+    hint:
+      "Anthropic OpenAI-compatible endpoint. Use a Claude model enabled for your key.",
+    base_url: "https://api.anthropic.com/v1",
+    text_model: "claude-sonnet-4-5",
+    session_header: "",
+    user_agent: "Muse/0.1.0",
+  },
+  deepseek: {
+    label: "DeepSeek",
+    hint:
+      "DeepSeek OpenAI-compatible API. Select a tool-capable DeepSeek model.",
+    base_url: "https://api.deepseek.com",
+    text_model: "deepseek-flash",
+    session_header: "",
+    user_agent: "Muse/0.1.0",
+  },
   custom: {
     label: "Custom",
     hint:

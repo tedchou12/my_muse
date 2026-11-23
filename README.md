@@ -335,7 +335,7 @@ Important details:
 Open **Provider** in the sidebar. It is the easiest way to switch models and
 providers without editing `.env` or recreating the container.
 
-- Presets: **OpenCode Go**, **OpenCode Console**, **OpenAI**, **Custom**.
+- Presets: **OpenAI**, **OpenRouter**, **Claude**, **DeepSeek**, **OpenCode Go**, **OpenCode Console**, **Custom**.
 - Text endpoint, model, User-Agent and session header are editable.
 - Separate image base URL/key/model for providers that are text-only (Go).
 - API keys are **write-only**: blank means “keep the saved key”; a Clear checkbox
