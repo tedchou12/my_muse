@@ -1,0 +1,29 @@
+# Secrets & runtime data
+.env
+stack.env
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Image / upload archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+muse-images*
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

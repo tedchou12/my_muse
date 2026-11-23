@@ -1,0 +1,75 @@
+services:
+  muse:
+    build:
+      context: .
+    image: muse:local
+    container_name: muse
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Local-only by default. Put a TLS reverse proxy in front for remote access.
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # Shell commands run in an ephemeral workspace. Enable the feature in
+      # Settings; every command still requires approval.
+      SHELL_WORKSPACE_DIR: /workspace
+    volumes:
+      - muse-data:/data
+      - muse-workspace:/workspace
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    shm_size: "1gb"
+    init: true
+    depends_on:
+      - browser
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  browser:
+    build:
+      context: .
+      dockerfile: browser/Dockerfile
+    image: muse-browser:local
+    container_name: muse-browser
+    restart: unless-stopped
+    shm_size: "1gb"
+    init: true
+    # noVNC only on the loopback interface. CDP (9222) stays on the
+    # compose network and is never published to the host.
+    ports:
+      - "127.0.0.1:6080:6080"
+    environment:
+      BROWSER_SCREEN: 1440x900x24
+      CDP_PUBLIC_HOST: browser:9223
+    volumes:
+      - browser-data:/profile
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9223/json/version', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  muse-data:
+  muse-workspace:
+  browser-data:
