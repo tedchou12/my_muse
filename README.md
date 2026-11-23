@@ -12,6 +12,10 @@ one Docker container on your own machine.
 > respective products; this project is an independent, self-hosted
 > reinterpretation of their public ideas.
 
+<p align="center">
+  <img src="sample.png" alt="Muse chat and browser agent interface" width="100%">
+</p>
+
 ---
 
 ## 1. What Meta Muse is (research summary)
