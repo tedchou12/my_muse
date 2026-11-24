@@ -370,6 +370,9 @@ class Agent:
                 }
             )
         schemas = [spec.schema() for spec in self.services.tools.values()]
+        # Named agents may pin their own model; the provider default is used
+        # for Muse itself and for agents without an override.
+        model = ((self.profile or {}).get("model") or "").strip() or None
         cancel = None
         if getattr(self.services, "cancellations", None) is not None:
             cancel = self.services.cancellations.begin(chat_id)
@@ -421,7 +424,7 @@ class Agent:
                     nudged_at = remaining
             try:
                 response = await self.services.openai.achat(
-                    messages, tools=schemas, session_id=chat_id
+                    messages, tools=schemas, session_id=chat_id, model=model
                 )
             except OpenAIConfigError as exc:
                 raise AgentError(str(exc))

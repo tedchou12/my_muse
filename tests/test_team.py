@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from conftest import (
     CSRF,
@@ -333,7 +334,10 @@ def test_cancelling_a_running_agent_stops_the_loop(app):
     services.settings.max_agent_steps = 0
 
     class SlowLoop(FakeOpenAI):
-        async def achat(self, messages, tools=None, temperature=None, session_id=None):
+        async def achat(
+            self, messages, tools=None, temperature=None, session_id=None, model=None
+        ):
+            self.models_used.append(model)
             await asyncio.sleep(0.02)
             return FakeResponse(
                 FakeMessage(
@@ -383,8 +387,11 @@ def test_queued_message_enters_agent_context(app):
             super().__init__(settings)
             self.calls = 0
 
-        async def achat(self, messages, tools=None, temperature=None, session_id=None):
+        async def achat(
+            self, messages, tools=None, temperature=None, session_id=None, model=None
+        ):
             self.chat_calls.append(messages)
+            self.models_used.append(model)
             self.calls += 1
             await asyncio.sleep(0.02)
             if self.calls == 1:
@@ -475,3 +482,118 @@ def test_team_api_task_flow(app, auth_client):
     detail = auth_client.get("/api/team/tasks/%d" % task_id).json()
     assert detail["task"]["result"] == "API task done."
     assert any(item["kind"] == "assignment" for item in detail["messages"])
+
+
+def test_agent_trusted_commands_persist(app, auth_client):
+    created = auth_client.post(
+        "/api/team/agents",
+        json={
+            "brief": "A tiny kiosk bot that only checks a status endpoint.",
+            "name": "Tiny",
+            "trusted_commands": ["git status", "curl -s https://api.example.com*"],
+        },
+        headers=CSRF,
+    )
+    assert created.status_code == 200, created.text
+    agent = created.json()["agent"]
+    assert json.loads(agent["trusted_commands"]) == [
+        "git status",
+        "curl -s https://api.example.com*",
+    ]
+
+    updated = auth_client.patch(
+        "/api/team/agents/%d" % agent["id"],
+        json={"trusted_commands": ["ls"]},
+        headers=CSRF,
+    )
+    assert updated.status_code == 200, updated.text
+    assert json.loads(updated.json()["agent"]["trusted_commands"]) == ["ls"]
+
+
+def test_agent_model_created_via_api_and_persisted(app, auth_client):
+    created = auth_client.post(
+        "/api/team/agents",
+        json={
+            "brief": "A lightweight helper for small lookup jobs.",
+            "name": "Cheapskate",
+            "model": "hy4-flash-free",
+        },
+        headers=CSRF,
+    )
+    assert created.status_code == 200, created.text
+    agent = created.json()["agent"]
+    assert agent["model"] == "hy4-flash-free"
+
+    updated = auth_client.patch(
+        "/api/team/agents/%d" % agent["id"],
+        json={"model": "qwen3.8-flash"},
+        headers=CSRF,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["agent"]["model"] == "qwen3.8-flash"
+
+    cleared = auth_client.patch(
+        "/api/team/agents/%d" % agent["id"],
+        json={"model": ""},
+        headers=CSRF,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["agent"]["model"] == ""
+
+
+def test_chat_with_agent_uses_pinned_model(app, auth_client):
+    fake = install_fake_ai(app, [FakeMessage(content="Cheap hello.")])
+    services = app.state.services
+    agent = services.team.create_agent(
+        "Frugal",
+        "Cheap assistant",
+        "Answer quickly and cheaply.",
+        model="hy4-flash-free",
+    )
+    response = auth_client.post(
+        "/api/chat",
+        json={
+            "message": "hello",
+            "chat_id": "agent:%d:dm" % agent["id"],
+            "agent_id": agent["id"],
+        },
+        headers=CSRF,
+    )
+    assert response.status_code == 200, response.text
+    assert fake.models_used == ["hy4-flash-free"]
+
+
+def test_default_agent_uses_provider_default_model(app):
+    fake = install_fake_ai(app, [FakeMessage(content="Hi.")])
+    services = app.state.services
+    asyncio.run(services.agent.run(chat_id="model-default", user_text="hello"))
+    assert fake.models_used == [None]
+
+
+def test_team_runner_uses_agent_model(app):
+    fake = install_fake_ai(app, [FakeMessage(content="Cheap task done.")])
+    services = app.state.services
+    team = services.team
+    agent = team.create_agent(
+        "Economist",
+        "Cheap runner",
+        "Do the job cheaply.",
+        model="hy4-flash-free",
+    )
+    task = team.create_task("Cheap job", "Do it cheaply.", agent["id"])
+    result = asyncio.run(services.team_runner.run_task(task["id"]))
+    assert result["status"] == "done"
+    assert result["result"] == "Cheap task done."
+    assert fake.models_used == ["hy4-flash-free"]
+
+
+def test_fail_task_fills_empty_result(app):
+    team = app.state.services.team
+    agent = team.create_agent("Failing", "Runner", "Do it.")
+    task = team.create_task("Will fail", "Do it.", agent["id"])
+    team.claim_task(task["id"])
+    failed = team.fail_task(task["id"], "boom")
+    assert failed["status"] == "failed"
+    assert failed["error"] == "boom"
+    # The board must never show a failed task with a blank result.
+    assert failed["result"] == "boom"

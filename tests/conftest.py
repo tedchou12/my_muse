@@ -62,9 +62,13 @@ class FakeOpenAI:
         self.settings = settings
         self.script: List[Any] = list(script or [])
         self.chat_calls: List[List[Dict[str, Any]]] = []
+        self.models_used: List[Optional[str]] = []
 
-    async def achat(self, messages, tools=None, temperature=None, session_id=None):
+    async def achat(
+        self, messages, tools=None, temperature=None, session_id=None, model=None
+    ):
         self.chat_calls.append(messages)
+        self.models_used.append(model)
         if self.script:
             step = self.script.pop(0)
             if isinstance(step, FakeMessage):

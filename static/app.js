@@ -582,9 +582,7 @@ function startVaultPolling() {
       if (!status.unlocked) {
         await loadVault();
       } else {
-        $("#vault-timer").textContent = status.seconds_until_lock
-          ? "locks in " + Math.ceil(status.seconds_until_lock / 60) + " min"
-          : "unlocked";
+        $("#vault-timer").textContent = "unlocked";
       }
     } catch (error) {
       /* ignore */
@@ -1553,12 +1551,26 @@ async function loadGroups() {
   }
 }
 
+function parseTrustedCommands(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
+    }
+  }
+  return [];
+}
+
 function renderTeamAgents(agents) {
   const list = $("#bot-list");
   list.innerHTML = agents.length
     ? agents
         .map((agent) => {
           const paused = agent.status !== "active";
+          const trust = parseTrustedCommands(agent.trusted_commands);
           return (
             '<div class="item"><div class="grow"><h4>#' +
             esc(agent.id) +
@@ -1566,7 +1578,14 @@ function renderTeamAgents(agents) {
             esc(agent.name) +
             ' <span class="badge">' +
             esc(agent.status) +
-            "</span></h4>" +
+            "</span>" +
+            (agent.model
+              ? ' <span class="badge" title="Pinned model">' + esc(agent.model) + "</span>"
+              : "") +
+            (trust.length
+              ? ' <span class="badge" title="Trusted shell commands">trust ' + trust.length + "</span>"
+              : "") +
+            "</h4>" +
             '<div class="meta">' +
             esc(agent.role || "No role") +
             " · " +
@@ -1590,6 +1609,16 @@ function renderTeamAgents(agents) {
             '">' +
             (paused ? "Resume" : "Pause") +
             "</button>" +
+            '<button class="ghost" data-bot-action="model" data-id="' +
+            esc(agent.id) +
+            '" data-model="' +
+            esc(agent.model || "") +
+            '">Model</button>' +
+            '<button class="ghost" data-bot-action="trust" data-id="' +
+            esc(agent.id) +
+            '" data-trust="' +
+            esc(agent.trusted_commands || "[]") +
+            '">Trust</button>' +
             '<button class="danger" data-bot-action="archive" data-id="' +
             esc(agent.id) +
             '">Archive</button></div></div>'
@@ -1678,16 +1707,18 @@ async function createBot(event) {
   const button = event.target.querySelector('button[type="submit"]');
   const brief = $("#bot-brief").value.trim();
   const name = $("#bot-name").value.trim();
+  const model = $("#bot-model").value.trim();
   if (!brief) return;
   button.disabled = true;
   button.textContent = "Designing…";
   try {
     const result = await api("/api/team/agents", {
       method: "POST",
-      body: { brief: brief, name: name || null },
+      body: { brief: brief, name: name || null, model: model || null },
     });
     $("#bot-brief").value = "";
     $("#bot-name").value = "";
+    $("#bot-model").value = "";
     toast("Created " + result.agent.name + ".");
     await loadTeam();
     await refreshBadges();
@@ -1748,6 +1779,48 @@ async function onTeamAction(event) {
         }
         await api("/api/team/agents/" + id, { method: "DELETE" });
         toast("Bot archived.");
+      } else if (action === "trust") {
+        const current = parseTrustedCommands(botButton.dataset.trust).join(", ");
+        const answer = window.prompt(
+          "Shell commands this bot may run without asking (comma separated; end with * for a prefix):",
+          current
+        );
+        if (answer === null) {
+          botButton.disabled = false;
+          return;
+        }
+        const commands = answer
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean);
+        await api("/api/team/agents/" + id, {
+          method: "PATCH",
+          body: { trusted_commands: commands },
+        });
+        toast(
+          commands.length
+            ? "Bot may run " + commands.length + " trusted command(s) without approval."
+            : "Agent command trust cleared."
+        );
+      } else if (action === "model") {
+        const current = botButton.dataset.model || "";
+        const model = window.prompt(
+          "Model id for this bot (blank = provider default):",
+          current
+        );
+        if (model === null) {
+          botButton.disabled = false;
+          return;
+        }
+        await api("/api/team/agents/" + id, {
+          method: "PATCH",
+          body: { model: model.trim() },
+        });
+        toast(
+          model.trim()
+            ? "Bot now runs on " + model.trim() + "."
+            : "Bot restored to the provider default model."
+        );
       } else {
         await api("/api/team/agents/" + id, {
           method: "PATCH",
@@ -1891,9 +1964,8 @@ function renderVault(status, entries) {
     gate.innerHTML =
       '<form id="vault-unlock" class="card form-grid">' +
       '<div class="wide"><h3>Vault locked</h3><p class="muted small">Unlock to add, ' +
-      "reveal or autofill credentials. It locks again after " +
-      Math.round(status.idle_lock_seconds / 60) +
-      " minutes of inactivity.</p></div>" +
+      "reveal or autofill credentials. It remains unlocked until you lock it " +
+      "or Muse restarts.</p></div>" +
       '<label>Master password<input id="vault-pass" type="password" required autocomplete="current-password"></label>' +
       '<div class="wide actions"><span></span><button class="primary" type="submit">Unlock</button></div></form>';
     $("#vault-unlock").addEventListener("submit", unlockVault);
@@ -1901,9 +1973,7 @@ function renderVault(status, entries) {
   }
   gate.innerHTML = "";
   body.classList.remove("hidden");
-  timer.textContent = status.seconds_until_lock
-    ? "locks in " + Math.ceil(status.seconds_until_lock / 60) + " min"
-    : "unlocked";
+  timer.textContent = "unlocked";
   renderEntries(entries);
 }
 
@@ -2205,6 +2275,20 @@ async function refreshBrowserStatus() {
     const showShot = Boolean(!status.view_url && status.started && activeHere);
     const ownerBadge = $("#browser-owner");
     if (ownerBadge) ownerBadge.textContent = owner;
+    const controlBtn = $("#browser-control");
+    if (controlBtn) {
+      const userHasControl = status.control === "user";
+      controlBtn.textContent = userHasControl ? "Release control" : "Take control";
+      controlBtn.classList.toggle("primary", userHasControl);
+      controlBtn.classList.toggle("ghost", !userHasControl);
+    }
+    const subtitle = $("#browser-subtitle");
+    if (subtitle) {
+      subtitle.textContent =
+        status.control === "user"
+          ? "You have control — click and type in the view; agent browser actions are paused."
+          : "View only — press Take control to click and type.";
+    }
     $("#browser-state").textContent = !status.enabled
       ? "disabled"
       : status.started
@@ -2402,6 +2486,16 @@ async function loadApprovals() {
     const count = pending.length + credentialCount;
     $("#approval-count").textContent = count ? String(count) : "";
     $("#approval-count").classList.toggle("hidden", count === 0);
+    const pendingBadge = $("#approval-pending-count");
+    if (pendingBadge) {
+      pendingBadge.textContent = pending.length ? String(pending.length) : "";
+      pendingBadge.classList.toggle("hidden", pending.length === 0);
+    }
+    const credentialBadge = $("#credential-pending-count");
+    if (credentialBadge) {
+      credentialBadge.textContent = credentialCount ? String(credentialCount) : "";
+      credentialBadge.classList.toggle("hidden", credentialCount === 0);
+    }
     renderCredentialRequests(data.pending_credentials || []);
     renderTrustedHosts(data.trusted_hosts || []);
     renderTrustedCommands(
@@ -2695,6 +2789,7 @@ async function loadSettings() {
     $("#set-auto").checked = Boolean(prefs.auto_approve_writes);
     $("#set-browser-auto").checked = Boolean(prefs.auto_approve_browser);
     $("#set-shell").checked = Boolean(prefs.shell_enabled);
+    $("#set-browser-lan").checked = Boolean(prefs.browser_allow_private);
     $("#set-models").textContent =
       "Text: " +
       data.limits.text_model +
@@ -2719,6 +2814,7 @@ async function saveSettings(event) {
     auto_approve_writes: $("#set-auto").checked,
     auto_approve_browser: $("#set-browser-auto").checked,
     shell_enabled: $("#set-shell").checked,
+    browser_allow_private: $("#set-browser-lan").checked,
   };
   try {
     const data = await api("/api/settings", { method: "PUT", body: payload });
@@ -3258,6 +3354,7 @@ async function saveProvider(event) {
     await loadProvider();
     state.session = await api("/api/session");
     toast("Provider saved. New requests use it immediately.");
+    listProviderModels().catch(() => {});
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -3292,6 +3389,86 @@ async function testProvider() {
     }
   } catch (error) {
     result.textContent = "FAILED\n" + error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderModelMenu(menu, input, models) {
+  if (!menu || !input) return;
+  menu.textContent = "";
+  for (const id of models) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = id;
+    button.addEventListener("click", () => {
+      input.value = id;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      menu.classList.add("hidden");
+    });
+    menu.appendChild(button);
+  }
+  menu.classList.toggle("hidden", !models.length);
+}
+
+async function listProviderModels() {
+  const button = $("#provider-models-btn");
+  const result = $("#provider-models-result");
+  const menu = $("#provider-model-menu");
+  if (!button || !result) return;
+  const body = {
+    preset:
+      state.providerPreset || (state.provider && state.provider.preset) || "custom",
+    base_url: $("#provider-base").value.trim() || null,
+    user_agent: $("#provider-ua").value.trim() || null,
+    session_header: $("#provider-session").value.trim() || null,
+  };
+  const key = $("#provider-key").value.trim();
+  if (key) body.api_key = key;
+  button.disabled = true;
+  if (menu) menu.classList.add("hidden");
+  result.textContent = "Listing models…";
+  try {
+    const data = await api("/api/provider/models", { method: "POST", body });
+    if (data.ok && data.models.length) {
+      renderModelMenu(menu, $("#provider-model"), data.models);
+      result.textContent = data.models.length + " models available — pick one below.";
+    } else if (data.ok) {
+      if (menu) menu.classList.add("hidden");
+      result.textContent = "Provider returned no models.";
+    } else {
+      if (menu) menu.classList.add("hidden");
+      result.textContent =
+        "Model listing failed: " + (data.error || "unknown error");
+    }
+  } catch (error) {
+    if (menu) menu.classList.add("hidden");
+    result.textContent = "Model listing failed: " + error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function listBotModels() {
+  const button = $("#bot-models-btn");
+  const menu = $("#bot-model-menu");
+  if (!button || !menu) return;
+  button.disabled = true;
+  menu.classList.add("hidden");
+  try {
+    const data = await api("/api/provider/models", { method: "POST", body: {} });
+    if (data.ok && data.models.length) {
+      renderModelMenu(menu, $("#bot-model"), data.models);
+    } else {
+      toast(
+        data.ok
+          ? "Provider returned no models."
+          : "Model listing failed: " + (data.error || "unknown error"),
+        true
+      );
+    }
+  } catch (error) {
+    toast(error.message, true);
   } finally {
     button.disabled = false;
   }
@@ -3403,6 +3580,23 @@ function bindEvents() {
     refreshBrowserShot();
   });
   $("#browser-diagnostics").addEventListener("click", loadBrowserDiagnostics);
+  $("#browser-control").addEventListener("click", async () => {
+    const userHasControl = state.browser && state.browser.control === "user";
+    try {
+      await api("/api/browser/control", {
+        method: "POST",
+        body: { mode: userHasControl ? "release" : "take" },
+      });
+      toast(
+        userHasControl
+          ? "Control returned to the agent."
+          : "You have the browser. Agent browser actions are paused."
+      );
+      await refreshBrowserStatus();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
   $("#browser-clear-site").addEventListener("click", clearBrowserSite);
   $("#browser-back-chat").addEventListener("click", () => switchTab("chat"));
   $("#browser-shot").addEventListener("error", () => {
@@ -3423,6 +3617,17 @@ function bindEvents() {
   });
   $("#provider-form").addEventListener("submit", saveProvider);
   $("#provider-test").addEventListener("click", testProvider);
+  $("#provider-models-btn").addEventListener("click", listProviderModels);
+  $("#bot-models-btn").addEventListener("click", listBotModels);
+  document.addEventListener("click", (event) => {
+    for (const menu of $$(".model-menu")) {
+      if (menu.classList.contains("hidden")) continue;
+      if (menu.contains(event.target)) continue;
+      const owner = menu.closest("label") || menu.parentElement;
+      if (owner && owner.contains(event.target)) continue;
+      menu.classList.add("hidden");
+    }
+  });
 }
 
 async function boot() {

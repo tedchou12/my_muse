@@ -166,3 +166,107 @@ def test_openai_service_uses_saved_provider(monkeypatch, app, auth_client):
     assert captured["base_url"] == GO_PAYLOAD["base_url"]
     assert captured["default_headers"]["User-Agent"] == "Muse/0.1.0"
     assert service.configured is True
+
+
+def _install_real_openai_service(app):
+    """Restore the real OpenAIService (the app fixture installs FakeOpenAI)."""
+    from app.openai_client import OpenAIService
+
+    services = app.state.services
+    services.openai = OpenAIService(services.settings, services.providers)
+    return services
+
+
+class _FakeModels:
+    def __init__(self, items, error=None, capture=None):
+        self._items = items
+        self._error = error
+        self._capture = capture
+
+    def list(self, **kwargs):
+        if self._capture is not None:
+            self._capture.update(kwargs)
+        if self._error is not None:
+            raise self._error
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=[SimpleNamespace(id=i) for i in self._items])
+
+
+def test_provider_models_lists_and_sorts(app, auth_client, monkeypatch):
+    services = _install_real_openai_service(app)
+    captured = {}
+
+    class FakeSDK:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.models = _FakeModels(
+                ["zeta", "alpha", "alpha", ""], capture=captured
+            )
+
+    monkeypatch.setattr("app.openai_client.OpenAI", FakeSDK)
+
+    result = auth_client.post(
+        "/api/provider/models",
+        headers=CSRF,
+        json={"base_url": GO_PAYLOAD["base_url"]},
+    )
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["ok"] is True
+    assert data["models"] == ["alpha", "zeta"]
+    assert captured["api_key"] == "sk-test-key"
+    assert captured["base_url"] == GO_PAYLOAD["base_url"]
+    assert "sk-test-key" not in result.text
+
+    audit = auth_client.get("/api/activity").json()
+    events = [i for i in audit["audit"] if i["action"] == "provider_models"]
+    assert events and events[0]["outcome"] == "ok"
+
+
+def test_provider_models_redacts_key_on_failure(app, auth_client, monkeypatch):
+    services = _install_real_openai_service(app)
+
+    class FakeSDK:
+        def __init__(self, **kwargs):
+            self.models = _FakeModels([], error=RuntimeError("auth failed %s" % SECRET))
+
+    monkeypatch.setattr("app.openai_client.OpenAI", FakeSDK)
+
+    result = auth_client.post(
+        "/api/provider/models",
+        headers=CSRF,
+        json={"api_key": SECRET},
+    )
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["ok"] is False
+    assert data["models"] == []
+    assert SECRET not in result.text
+    assert "[redacted]" in data["error"]
+
+    audit = auth_client.get("/api/activity").json()
+    events = [i for i in audit["audit"] if i["action"] == "provider_models"]
+    assert events and events[0]["outcome"] == "error"
+    assert SECRET not in str(events[0]["detail"])
+
+
+def test_provider_models_requires_key(app, auth_client):
+    auth_client.put(
+        "/api/provider", json=dict(GO_PAYLOAD, clear_api_key=True), headers=CSRF
+    )
+    result = auth_client.post("/api/provider/models", headers=CSRF, json={})
+    assert result.status_code == 400
+
+
+def test_provider_models_requires_auth(app, client):
+    assert client.post("/api/provider/models", json={}, headers=CSRF).status_code == 401
+
+
+def test_provider_models_unsupported_service(app, auth_client):
+    # The app fixture installs FakeOpenAI, which has no list_models support.
+    result = auth_client.post("/api/provider/models", headers=CSRF, json={})
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["ok"] is False
+    assert "unavailable" in data["error"]

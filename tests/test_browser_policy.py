@@ -68,6 +68,87 @@ def test_diagnostics_capture_and_limit(settings):
     assert len(manager.console_events) <= 120
 
 
+async def test_multi_step_login_fills_username_then_password(settings):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    class StepPage:
+        url = "https://example.com/login"
+
+        def __init__(self):
+            self.fills = []
+            self.clicks = []
+            self.presses = []
+            self.evaluated = 0
+
+        async def fill(self, selector, value, timeout=None):
+            self.fills.append((selector, value))
+
+        async def click(self, selector, timeout=None):
+            self.clicks.append(selector)
+
+        async def press(self, selector, key):
+            self.presses.append((selector, key))
+
+        async def evaluate(self, script):
+            self.evaluated += 1
+            return {
+                "username": "",
+                "password": "#password",
+                "submit": "#signin",
+            }
+
+    page = StepPage()
+    filled, otp_submitted, otp_error = await manager._submit_credential(
+        page,
+        {"username": "me@example.com", "password": "secret", "totp_secret": ""},
+        "#username",
+        "",
+        "#next",
+    )
+
+    assert filled == 2
+    assert otp_submitted is False
+    assert otp_error == ""
+    assert page.fills == [
+        ("#username", "me@example.com"),
+        ("#password", "secret"),
+    ]
+    assert page.clicks == ["#next", "#signin"]
+    assert page.evaluated >= 1
+
+
+async def test_multi_step_login_password_only(settings):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    class PasswordPage:
+        url = "https://example.com/login/password"
+
+        def __init__(self):
+            self.fills = []
+            self.presses = []
+
+        async def fill(self, selector, value, timeout=None):
+            self.fills.append((selector, value))
+
+        async def press(self, selector, key):
+            self.presses.append((selector, key))
+
+    page = PasswordPage()
+    filled, otp_submitted, otp_error = await manager._submit_credential(
+        page,
+        {"username": "me@example.com", "password": "secret", "totp_secret": ""},
+        "",
+        "#password",
+        "",
+    )
+
+    assert filled == 1
+    assert otp_submitted is False
+    assert otp_error == ""
+    assert page.fills == [("#password", "secret")]
+    assert page.presses == [("#password", "Enter")]
+
+
 def test_browser_status_exposes_remote_view(settings):
     settings.browser_cdp_url = "http://browser:9223"
     settings.browser_vnc_url = "http://127.0.0.1:6080/vnc.html"
@@ -75,6 +156,41 @@ def test_browser_status_exposes_remote_view(settings):
     status = manager.status()
     assert status["remote"] is True
     assert status["view_url"] == "http://127.0.0.1:6080/vnc.html"
+
+
+def test_view_url_follows_request_host(settings):
+    from app.browser import rewrite_view_host
+
+    url = "http://192.168.1.6:6080/vnc.html?autoconnect=1&reconnect=1"
+    assert (
+        rewrite_view_host(url, "Jetson.local")
+        == "http://jetson.local:6080/vnc.html?autoconnect=1&reconnect=1"
+    )
+    assert (
+        rewrite_view_host(url, "10.0.0.5")
+        == "http://10.0.0.5:6080/vnc.html?autoconnect=1&reconnect=1"
+    )
+    # No explicit port in the config -> none in the rewrite.
+    assert rewrite_view_host("http://host/vnc.html", "x.test") == "http://x.test/vnc.html"
+    # IPv6 literals keep their brackets.
+    assert rewrite_view_host("http://[::1]:6080/vnc.html", "[::1]") == "http://[::1]:6080/vnc.html"
+    # Unusable input falls back to the configured URL.
+    assert rewrite_view_host(url, None) == url
+    assert rewrite_view_host(url, "") == url
+    assert rewrite_view_host(url, "host/evil") == url
+    assert rewrite_view_host("", "x.test") == ""
+    assert rewrite_view_host("javascript:alert(1)", "x.test") == "javascript:alert(1)"
+
+    settings.browser_vnc_url = url
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+    assert (
+        manager.status(request_host="jetson.local")["view_url"]
+        == "http://jetson.local:6080/vnc.html?autoconnect=1&reconnect=1"
+    )
+    assert (
+        manager.diagnostics(request_host="jetson.local")["view_url"]
+        == "http://jetson.local:6080/vnc.html?autoconnect=1&reconnect=1"
+    )
 
 
 def test_agent_contexts_are_isolated(settings):
@@ -220,6 +336,265 @@ def test_cors_injection_is_domain_scoped(settings):
         headers={"origin": "https://github.com"},
     )
     assert asyncio.run(manager._inject_cors(FakeRoute(), offsite)) is False
+
+
+def test_otp_detection_scans_child_frames(settings):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    class Frame:
+        def __init__(self, info):
+            self.info = info
+
+        async def evaluate(self, script):
+            return self.info
+
+    class Page:
+        def __init__(self):
+            self.url = "https://example.com/login"
+            self.frame0 = Frame(None)
+            self.main_frame = self.frame0
+            self.frames = [
+                self.frame0,
+                Frame({"otp": "#code", "submit": "#go", "segmented": True}),
+            ]
+
+        async def evaluate(self, script):
+            return None
+
+        async def title(self):
+            return "Sign in"
+
+    page = Page()
+
+    async def ensure(session):
+        return page
+
+    manager._ensure_page = ensure  # type: ignore[assignment]
+    info = asyncio.run(manager.detect_otp_fields())
+    assert info["otp"] == "#code"
+    assert info.get("frame") is True
+    assert info.get("segmented") is True
+
+
+def test_read_flags_javascript_only_pages(settings):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    class Page:
+        url = "https://spa.example/"
+
+        async def inner_text(self, selector):
+            return ""
+
+        async def title(self):
+            return "SPA"
+
+        async def evaluate(self, script):
+            return {"scripts": 7, "text_length": 0, "has_root": True}
+
+    async def ensure(session):
+        return Page()
+
+    manager._ensure_page = ensure  # type: ignore[assignment]
+    data = asyncio.run(manager.read())
+    assert data["needs_javascript"] is True
+    assert "[needs-JS]" in data["text"]
+
+
+def test_read_does_not_flag_text_pages(settings):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    class Page:
+        url = "https://example.com/"
+
+        async def inner_text(self, selector):
+            return "Plenty of readable text. " * 20
+
+        async def title(self):
+            return "Normal"
+
+        async def evaluate(self, script):
+            return {"scripts": 2, "text_length": 600, "has_root": False}
+
+    async def ensure(session):
+        return Page()
+
+    manager._ensure_page = ensure  # type: ignore[assignment]
+    data = asyncio.run(manager.read())
+    assert "needs_javascript" not in data
+
+
+class FakeKeyboard:
+    def __init__(self):
+        self.pressed = []
+
+    async def press(self, key):
+        self.pressed.append(key)
+
+
+class FakeLocator:
+    def __init__(self, count=1, click_errors=None, sink=None, fill_sink=None):
+        self._count = count
+        self.click_errors = list(click_errors or [])
+        self.sink = sink if sink is not None else []
+        self.fill_sink = fill_sink if fill_sink is not None else []
+        self.fills = []
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return self._count
+
+    async def is_visible(self):
+        return True
+
+    async def scroll_into_view_if_needed(self, timeout=None):
+        return None
+
+    async def click(self, timeout=None, force=False):
+        self.sink.append(force)
+        if self.click_errors:
+            error = self.click_errors.pop(0)
+            if error:
+                raise RuntimeError(error)
+
+    async def fill(self, text, timeout=None):
+        self.fills.append(text)
+        self.fill_sink.append(text)
+
+    async def press(self, key, timeout=None):
+        self.fills.append("<enter>")
+
+    async def dispatch_event(self, name, timeout=None):
+        self.sink.append("dispatch")
+
+    def locator(self, selector):
+        return FakeLocator(count=0, sink=self.sink, fill_sink=self.fill_sink)
+
+    async def get_attribute(self, name, timeout=None):
+        return ""
+
+
+class FakeFrame:
+    def __init__(self, url="", by_text=None, by_value=None, by_label=None):
+        self.url = url
+        self.by_text = set(by_text or [])
+        self.by_value = set(by_value or [])
+        self.by_label = set(by_label or [])
+        self.body_text = ""
+        self.clicked = []
+        self.fills = []
+        self.fill_errors = []
+
+    def _locator(self, match):
+        errors = self.fill_errors if match else []
+        return FakeLocator(
+            count=1 if match else 0,
+            click_errors=errors,
+            sink=self.clicked,
+            fill_sink=self.fills,
+        )
+
+    def locator(self, selector):
+        if selector.startswith('input[value="'):
+            value = selector.split('"')[1]
+            return self._locator(value.lower() in {v.lower() for v in self.by_value})
+        return self._locator(False)
+
+    def get_by_text(self, text, exact=False):
+        return self._locator(text in self.by_text)
+
+    def get_by_role(self, role, name=None, exact=False):
+        return self._locator(False)
+
+    def get_by_label(self, text, exact=False):
+        return self._locator(text in self.by_label)
+
+    def get_by_placeholder(self, text, exact=False):
+        return self._locator(False)
+
+    async def inner_text(self, selector):
+        return self.body_text
+
+
+class FakePage(FakeFrame):
+    def __init__(self, frames=None, **kwargs):
+        super().__init__(url="https://example.com/page", **kwargs)
+        self.frames = [self] + list(frames or [])
+        self.main_frame = self
+        self.keyboard = FakeKeyboard()
+
+    async def title(self):
+        return "Fake page"
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.url = url
+
+    async def wait_for_load_state(self, state, timeout=None):
+        return None
+
+    async def evaluate(self, script):
+        if "scripts" in str(script):
+            return {"scripts": 0, "text_length": 40, "has_root": False}
+        return None
+
+
+def _manager_with_page(settings, page):
+    manager = BrowserManager(settings, None)  # type: ignore[arg-type]
+
+    async def ensure(session):
+        return page
+
+    manager._ensure_page = ensure  # type: ignore[assignment]
+    return manager
+
+
+def test_click_finds_value_button_inside_iframe(settings):
+    frame = FakeFrame(url="https://example.com/modal", by_value={"Confirm"})
+    page = FakePage(frames=[frame])
+    manager = _manager_with_page(settings, page)
+    result = asyncio.run(manager.click("Confirm"))
+    assert result["url"] == page.url
+    assert frame.clicked  # the click landed inside the iframe
+
+
+def test_click_retries_with_force_when_overlay_blocks(settings):
+    page = FakePage(by_text={"Confirm"})
+    page.fill_errors = ["element is not receiving pointer events (intercepted)"]
+    manager = _manager_with_page(settings, page)
+    asyncio.run(manager.click("Confirm"))
+    assert page.clicked[:2] == [False, True]
+
+
+def test_click_reports_actionable_no_match(settings):
+    page = FakePage()
+    manager = _manager_with_page(settings, page)
+    with pytest.raises(Exception) as info:
+        asyncio.run(manager.click("Nope"))
+    message = str(info.value)
+    assert "No element matched" in message
+    assert "kind='css'" in message
+
+
+def test_type_matches_by_label(settings):
+    page = FakePage(by_label={"Email address"})
+    manager = _manager_with_page(settings, page)
+    asyncio.run(manager.type_text("Email address", "me@example.com"))
+    assert page.clicked  # focused via click
+    assert "me@example.com" in page.fills
+
+
+def test_read_includes_iframe_text(settings):
+    frame = FakeFrame(url="https://example.com/frame")
+    frame.body_text = "The warning dialog says Confirm to continue."
+    page = FakePage(frames=[frame])
+    page.body_text = "Main page body"
+    manager = _manager_with_page(settings, page)
+    data = asyncio.run(manager.read())
+    assert "Main page body" in data["text"]
+    assert "[frame https://example.com/frame]" in data["text"]
+    assert "Confirm to continue" in data["text"]
 
 
 def test_private_networks_can_be_enabled_for_dev():

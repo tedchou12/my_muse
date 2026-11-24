@@ -50,6 +50,8 @@ class Preferences:
         "trusted_shell_commands": [],
         "trusted_shell_families": [],
         "trusted_shell_families_initialized": False,
+        "browser_allow_private": False,
+        "browser_control": "agent",
         "timezone": "UTC",
     }
 

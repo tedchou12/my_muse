@@ -198,12 +198,15 @@ class TaskIn(BaseModel):
     kind: str = Field(pattern=r"^(once|interval|cron)$")
     schedule: str = Field(min_length=1, max_length=200)
     timezone: Optional[str] = Field(default=None, max_length=80)
+    agent_id: Optional[int] = Field(default=None, ge=1)
 
 
 class TeamAgentIn(BaseModel):
     brief: str = Field(min_length=5, max_length=8000)
     name: Optional[str] = Field(default=None, max_length=60)
     role: Optional[str] = Field(default=None, max_length=200)
+    model: Optional[str] = Field(default=None, max_length=160)
+    trusted_commands: Optional[List[str]] = Field(default=None, max_length=50)
 
 
 class TeamAgentUpdateIn(BaseModel):
@@ -211,6 +214,7 @@ class TeamAgentUpdateIn(BaseModel):
     role: Optional[str] = Field(default=None, max_length=200)
     instructions: Optional[str] = Field(default=None, max_length=8000)
     model: Optional[str] = Field(default=None, max_length=160)
+    trusted_commands: Optional[List[str]] = Field(default=None, max_length=50)
     status: Optional[str] = Field(
         default=None, pattern=r"^(active|paused|archived)$"
     )
@@ -273,7 +277,12 @@ class SettingsIn(BaseModel):
     auto_approve_writes: Optional[bool] = None
     auto_approve_browser: Optional[bool] = None
     shell_enabled: Optional[bool] = None
+    browser_allow_private: Optional[bool] = None
     timezone: Optional[str] = Field(default=None, max_length=80)
+
+
+class BrowserControlIn(BaseModel):
+    mode: str = Field(pattern=r"^(take|release)$")
 
 
 class BrowserOpenIn(BaseModel):
@@ -317,6 +326,14 @@ class ProviderIn(BaseModel):
     image_api_key: Optional[str] = Field(default=None, max_length=1000)
     clear_api_key: bool = False
     clear_image_api_key: bool = False
+
+
+class ProviderModelsIn(BaseModel):
+    preset: Optional[str] = Field(default=None, max_length=40)
+    base_url: Optional[str] = Field(default=None, max_length=2048)
+    user_agent: Optional[str] = Field(default=None, max_length=200)
+    session_header: Optional[str] = Field(default=None, max_length=64)
+    api_key: Optional[str] = Field(default=None, max_length=1000)
 
 
 class CredentialFulfillIn(BaseModel):
@@ -752,7 +769,11 @@ async def create_team_agent(
 ) -> Dict[str, Any]:
     try:
         agent = await services.team.create_from_prompt(
-            payload.brief, name=payload.name, role=payload.role
+            payload.brief,
+            name=payload.name,
+            role=payload.role,
+            model=payload.model,
+            trusted_commands=payload.trusted_commands,
         )
     except TeamError as exc:
         raise _team_http_error(exc)
@@ -1177,9 +1198,21 @@ async def create_task(
     services: Services = Depends(get_services),
     _: str = Depends(require_auth),
 ) -> Dict[str, Any]:
+    if payload.agent_id is not None:
+        try:
+            agent = services.team.get_agent(int(payload.agent_id))
+        except TeamError as exc:
+            raise _team_http_error(exc)
+        if agent["status"] != "active":
+            raise HTTPException(400, "That agent is not active.")
     try:
         task = services.scheduler.create(
-            payload.title, payload.prompt, payload.kind, payload.schedule, payload.timezone
+            payload.title,
+            payload.prompt,
+            payload.kind,
+            payload.schedule,
+            payload.timezone,
+            agent_id=payload.agent_id,
         )
     except ScheduleError as exc:
         raise HTTPException(400, str(exc))
@@ -1701,11 +1734,40 @@ async def cancel_credential_request(
 # -- browser --------------------------------------------------------------
 @router.get("/api/browser/status")
 async def browser_status(
+    request: Request,
     session: str = Query("default", max_length=100),
     services: Services = Depends(get_services),
     _: str = Depends(require_auth),
 ) -> Dict[str, Any]:
-    return services.browser.status(session)
+    status = services.browser.status(
+        session, request_host=request.headers.get("host")
+    )
+    control = str(services.prefs.get("browser_control") or "agent")
+    status["control"] = control
+    status["allow_private_networks"] = bool(
+        services.prefs.get("browser_allow_private")
+        or services.settings.browser_allow_private_networks
+    )
+    view_url = status.get("view_url") or ""
+    if view_url and control != "user":
+        # Until the user takes control the live view is watch-only: noVNC
+        # ignores pointer and keyboard input with view_only=1.
+        separator = "&" if "?" in view_url else "?"
+        status["view_url"] = view_url + separator + "view_only=1"
+    return status
+
+
+@router.post("/api/browser/control")
+async def browser_control(
+    payload: BrowserControlIn,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Hand the browser to the human (pausing agent actions) or give it back."""
+    mode = "user" if payload.mode == "take" else "agent"
+    services.prefs.update({"browser_control": mode})
+    services.audit.log("user", "browser_control", {"mode": payload.mode}, "ok")
+    return {"control": mode}
 
 
 @router.get("/api/browser/otp-status")
@@ -1731,11 +1793,14 @@ async def browser_otp_status(
 
 @router.get("/api/browser/diagnostics")
 async def browser_diagnostics(
+    request: Request,
     session: str = Query("default", max_length=100),
     services: Services = Depends(get_services),
     _: str = Depends(require_auth),
 ) -> Dict[str, Any]:
-    return services.browser.diagnostics(session)
+    return services.browser.diagnostics(
+        session, request_host=request.headers.get("host")
+    )
 
 
 @router.post("/api/browser/clear-site")
@@ -1845,9 +1910,9 @@ async def read_settings(
         "preferences": services.prefs.all(),
         "limits": {
             "max_agent_steps": services.settings.max_agent_steps,
-            "vault_idle_lock_seconds": services.settings.vault_idle_lock_seconds,
             "scheduler_timezone": services.settings.scheduler_timezone,
             "browser_allowed_domains": services.settings.allowed_domains,
+            "vault_idle_lock_seconds": services.settings.vault_idle_lock_seconds,
             "text_model": config.text_model,
             "image_model": config.image_model,
         },
@@ -1946,6 +2011,75 @@ async def test_provider(
         "reply": reply,
         "error": error[:1000],
     }
+
+
+@router.post("/api/provider/models")
+async def list_provider_models(
+    payload: ProviderModelsIn,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Query the provider's OpenAI-protocol model discovery (GET /models)."""
+    values = payload.model_dump(exclude_unset=True)
+    base_url = str(values.get("base_url") or "").strip()
+    if base_url:
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "base_url must be an http(s) URL with a host.")
+        if parsed.username or parsed.password:
+            raise HTTPException(400, "base_url must not contain embedded credentials.")
+    header = str(values.get("session_header") or "").strip()
+    if header and not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header):
+        raise HTTPException(400, "Session header must be a valid HTTP header name.")
+    user_agent = str(values.get("user_agent") or "").strip()
+    if "\r" in user_agent or "\n" in user_agent:
+        raise HTTPException(400, "User-Agent must be a single line.")
+    api_key = values.get("api_key")
+    if api_key is not None:
+        api_key = str(api_key).strip()
+        if len(api_key) > 1000 or any(ord(char) < 32 for char in api_key):
+            raise HTTPException(400, "api_key contains invalid characters.")
+    api_key = api_key or None
+
+    if not (api_key or services.providers.current().api_key):
+        raise HTTPException(400, "No API key is configured yet.")
+
+    list_models = getattr(services.openai, "list_models", None)
+    if not callable(list_models):
+        return {
+            "ok": False,
+            "models": [],
+            "error": "Model listing is unavailable in this Muse build.",
+            "latency_ms": 0,
+        }
+
+    started = time.perf_counter()
+    ok = False
+    models: List[str] = []
+    error = ""
+    try:
+        models = await list_models(
+            base_url=base_url or None,
+            api_key=api_key,
+            user_agent=user_agent or None,
+            session_header=header or None,
+        )
+        ok = True
+    except Exception as exc:
+        error = "%s: %s" % (type(exc).__name__, exc)
+    latency_ms = round((time.perf_counter() - started) * 1000, 1)
+    redact = api_key or services.providers.current().api_key
+    if redact:
+        error = error.replace(redact, "[redacted]")
+    services.audit.log(
+        "user",
+        "provider_models",
+        {"ok": ok, "count": len(models), "latency_ms": latency_ms},
+        "ok" if ok else "error",
+    )
+    if ok:
+        return {"ok": True, "models": models, "latency_ms": latency_ms}
+    return {"ok": False, "models": [], "error": error[:1000], "latency_ms": latency_ms}
 
 
 # -- audit ----------------------------------------------------------------

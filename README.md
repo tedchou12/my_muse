@@ -53,7 +53,7 @@ Grok Bot:
 | Muse concept | This implementation |
 |---|---|
 | Agent, not chatbot | OpenAI tool-calling loop with persistent chat history and multi-step tool use |
-| Named AI teammates | Durable agents with a name, role and standing instructions, created from a plain-language prompt |
+| Named AI teammates | Durable agents with a name, role and standing instructions, created from a plain-language prompt; each can pin its own (cheaper) model |
 | Shared team board | Durable `agent_tasks` with assignee, status, parent/depth, result and run count |
 | Inter-agent handoff | `assign_task`, `send_message`, `read_inbox` and `list_team_tasks` plus a background team runner |
 | Self-rename | Named agents can update their own display name/role with `rename_self`; instructions and tasks stay intact |
@@ -85,7 +85,7 @@ Grok Bot:
 - [x] Scheduled tasks: one-off, fixed interval, cron; pause/resume/run-now/history
 - [x] Text generation (`generate_text`) saved as a Markdown artifact
 - [x] Image generation (`generate_image`) shown inline, approval-gated by default
-- [x] Encrypted vault with auto-lock, master-password rotation, reveal + audit
+- [x] Encrypted vault with manual lock, master-password rotation, reveal + audit
 - [x] Domain-bound credential autofill (`vault_fill`) that always needs approval
 - [x] Sandboxed Chromium: open, read, click, type, press, screenshot
 - [x] SSRF protection and optional domain allowlist for the browser
@@ -252,12 +252,12 @@ All settings are environment variables (or `.env`).
 | `BROWSER_ENABLED` | `true` | Enable Playwright tools. |
 | `BROWSER_HEADLESS` | `true` | Headless Chromium. |
 | `BROWSER_ALLOWED_DOMAINS` | empty | Comma-separated allowlist; empty = any public site. |
-| `BROWSER_ALLOW_PRIVATE_NETWORKS` | `false` | Test only. Never enable in production. |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | `false` | Allow private/LAN addresses in the browser (also toggleable per-install in Settings). Shell already reaches the LAN; keep this off unless you need it. |
 | `BROWSER_CORS_MODE` | `off` | `off` or `inject`; inject adds CORS headers only for allowlisted origins. |
 | `BROWSER_CORS_DOMAINS` | empty | Comma-separated origins for `inject` mode, e.g. `github.com`. |
 | `BROWSER_BLOCK_SERVICE_WORKERS` | `false` | Block service workers so they cannot bypass CORS-header injection. |
 | `BROWSER_CDP_URL` | empty | Attach to an external Chromium CDP endpoint, e.g. `http://browser:9223`. |
-| `BROWSER_VNC_URL` | empty | noVNC view for the external browser, embedded in the Browser tab. |
+| `BROWSER_VNC_URL` | empty | noVNC view for the external browser, embedded in the Browser tab. The hostname is taken from the request, so only the scheme, port and path need to be configured. |
 
 `WRITE_ENABLED`, `AUTO_APPROVE_WRITES`, `SHELL_ENABLED`, timezone and the agent
 persona can also be changed live in **Settings** (persisted in SQLite).
@@ -386,10 +386,18 @@ This is an agent team with real powers. Read this section.
   id is used as AAD, so ciphertext rows cannot be swapped.
 - A canary ciphertext verifies the master password; a locked vault does not reveal
   whether a label exists.
-- The key exists only in process memory, is zeroised on lock, and auto-locks after
-  inactivity.
+- The key exists only in process memory, is zeroised on manual lock, and stays
+  unlocked until you lock it or Muse restarts.
 - Labels and allowed domains are plaintext for listing; usernames, passwords, URLs,
   notes and the optional TOTP secret are encrypted.
+- **Secrets in shell commands.** Store a key in the vault (label + password),
+  then reference it as `{{secret:Label}}` — or a specific field with
+  `{{secret:Label.username|.notes|.url|.totp_secret}}` — inside one `run_shell`
+  command. Muse injects the value as a temporary `MUSE_SECRET_n` environment
+  variable at run time and redacts it from the command output, so the model can
+  use a stored secret without ever reading it. Commands with placeholders always
+  require approval unless the exact command (or the calling agent) is trusted,
+  and a locked vault simply refuses to resolve them.
 - A TOTP secret is decrypted only inside the browser process when `vault_fill`
   submits a login; it is never returned by the reveal endpoint or sent to the model.
 - **There is no recovery.** Back up the `muse-data` volume and remember the master
@@ -461,8 +469,26 @@ operate on the same browser.
   browser containers/profiles.
 - `BROWSER_VNC_URL=http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&reconnect=1`
   makes the Browser tab embed the live view. Without it, the tab falls back to
-  screenshots.
+  screenshots. The view URL's hostname is rewritten to match the host you use
+  to reach Muse, so the same config works over `localhost`, a LAN IP or a
+  hostname; only the scheme, port and path come from this setting.
 - **Open live view** opens the same noVNC page in a separate tab.
+- **Take control** in the Browser tab flips the live view from **view-only** to
+  interactive: until you press it, noVNC ignores your clicks and keys
+  (`view_only=1`) while agent actions continue; while you hold control the agent
+  is refused browser actions, so the two never fight over the same window.
+  Release it to hand the browser back.
+- **Targeting.** `browser_click`/`browser_type` resolve their target by CSS
+  selector, ARIA role, label, placeholder, visible text and input
+  value/alt/title/aria-label, searching the page **and its iframes** and using
+  the first visible match (`kind` pins one strategy). A blocked click retries
+  with `force`, presses Escape for backdrops, then falls back to following an
+  anchor's href. `browser_read` includes the text of child frames.
+- `browser_read` flags JavaScript-only pages (`needs_javascript` / a `[needs-JS]`
+  note in the text) so the agent switches to the site's API instead of guessing.
+- OTP detection covers `autocomplete="one-time-code"`, aria-label/placeholder
+  hints, passcode/pin fields, segmented single-character boxes and same-page
+  iframes.
 - The browser profile survives `docker compose restart browser`; the app can
   reconnect automatically.
 - noVNC is published only on the loopback interface. Do not expose port `6080`
@@ -667,11 +693,11 @@ approval gate as Muse.
    > the submit button and tell me what happened.
 
 4. The agent navigates, then requests `vault_fill`. **Approvals → Approve once**
-   (or **Approve all on &lt;host&gt;** to trust that site).
-   server decrypts the entry, verifies the page host is allowed, types the values,
-   and returns only “filled 2 fields”.
-5. The vault auto-locks after 15 minutes (`VAULT_IDLE_LOCK_SECONDS`). Lock it
-   manually when finished.
+   (or **Approve all on &lt;host&gt;** to trust that site). Muse fills a normal
+   username/password form, or follows a two-step SSO form: username/email →
+   **Next** → password. The server decrypts the entry, verifies the page host,
+   types the values, and returns only “filled 2 fields”.
+5. The vault remains unlocked until you click **Lock** or Muse restarts.
 
 The model never receives the username, password, URL or notes.
 
@@ -762,8 +788,8 @@ cookie. Non-GET requests require `X-Muse-Request: 1`.
 | `POST /api/chat/clear` | `{chat_id}` |
 | `GET /api/team` | Snapshot: agents, team tasks, recent messages, limits |
 | `GET /api/team/summary` | Counts for the Team badge |
-| `POST /api/team/agents` | `{brief, name?, role?}` → design and create a bot |
-| `PATCH /api/team/agents/{id}` | Update name/role/instructions/status |
+| `POST /api/team/agents` | `{brief, name?, role?, model?}` → design and create a bot (model optional; blank = provider default) |
+| `PATCH /api/team/agents/{id}` | Update name/role/instructions/status/model |
 | `DELETE /api/team/agents/{id}` | Archive a bot and cancel its queued tasks |
 | `GET /api/team/agents/{id}/inbox` | Agent messages (`unread_only`, `mark_read`) |
 | `GET /api/team/tasks` | Shared task board (`status`, `agent_id`, `limit`) |
@@ -780,7 +806,7 @@ cookie. Non-GET requests require `X-Muse-Request: 1`.
 | `POST /api/tasks/{id}/run` / `pause` / `resume` | Control a job |
 | `DELETE /api/tasks/{id}` | Delete job + history |
 | `GET /api/tasks/{id}/runs` | Run history |
-| `GET /api/vault/status` | Initialized / unlocked / auto-lock countdown |
+| `GET /api/vault/status` | Initialized / unlocked state |
 | `POST /api/vault/initialize` | `{master_password}` |
 | `POST /api/vault/unlock` / `lock` | Lock state |
 | `GET /api/vault/entries` | Labels + domains (no secrets) |
@@ -790,6 +816,7 @@ cookie. Non-GET requests require `X-Muse-Request: 1`.
 | `POST /api/vault/entries/{id}/reveal` | Plaintext (audited) |
 | `POST /api/vault/change-password` | Re-encrypt everything |
 | `GET /api/browser/status?session=` | Enabled / started / current URL, agent pages and CORS mode |
+| `POST /api/browser/control` | `{mode: "take"｜"release"}` hand the browser to the human; agent browser actions pause until released |
 | `POST /api/browser/select` | `{session}` bring an agent's page to the live view |
 | `GET /api/browser/diagnostics` | Recent console errors and failed requests |
 | `POST /api/browser/clear-site` | `{domain, session?}` clears only that site's cookies, cache, storage and service workers in that agent's browser window |
@@ -860,7 +887,7 @@ make test
 91 tests, no network and no real OpenAI calls (a scripted fake is injected):
 
 - **Vault**: initialize/unlock, wrong password, ciphertext-at-rest checks, domain
-  binding, hostname lookup, ambiguity detection, auto-lock, master-password
+  binding, hostname lookup, ambiguity detection, manual lock, master-password
   rotation, locked-vault behaviour.
 - **Scheduler**: interval/cron/once calculation, validation, pause/resume/delete,
   due-job execution, rescheduling, failure recording, recovery after restart.
@@ -899,9 +926,14 @@ Deliberately out of scope for v0.1:
 - **Single user, single container.** No multi-tenant isolation or per-user VMs.
 - **The team is in-process.** The runner is an asyncio loop in the API process,
   not a durable distributed queue. It is enough for one user and one container.
-- **Agents share the vault, approvals and model.** Each agent has an isolated
+- **Agents share the vault, approvals and sandbox.** Each agent has an isolated
   browser context/window and separate cookies, but there is no isolated computer
   or per-agent permission boundary yet; every agent uses the same sandbox and
+  approval gates. Each agent may pin its own model (e.g. a cheaper one) and its
+  own **trusted shell commands** (exact strings or `prefix*`), which skip the
+  approval prompt for that agent only; scheduled tasks can be assigned to an
+  agent and then run on that model. Muse itself can read teammate replies with
+  `read_inbox` from the normal chat, and agent task results land in that inbox.
   Sentinel rules. The `model` column is reserved for future per-agent routing
   and is not used yet.
 - **No Slack/Teams, meetings or per-bot computers yet.** The implementation

@@ -120,9 +120,10 @@ class OpenAIService:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: Optional[float] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        model: Optional[str] = None,
     ) -> Any:
         kwargs: Dict[str, Any] = {
-            "model": self._config().text_model,
+            "model": (model or "").strip() or self._config().text_model,
             "messages": messages,
         }
         if tools:
@@ -140,6 +141,7 @@ class OpenAIService:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: Optional[float] = None,
         session_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> Any:
         return await asyncio.to_thread(
             self.chat,
@@ -147,6 +149,7 @@ class OpenAIService:
             tools,
             temperature,
             self._extra_headers(self._config(), session_id),
+            model,
         )
 
     async def agenerate_text(
@@ -181,6 +184,42 @@ class OpenAIService:
         )
         content = response.choices[0].message.content
         return content or ""
+
+    # -- model discovery ---------------------------------------------------
+    async def list_models(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        session_header: Optional[str] = None,
+    ) -> List[str]:
+        """Query the OpenAI-protocol discovery endpoint (GET /models).
+
+        Optional arguments override the saved provider configuration so the
+        UI can list models from an endpoint the user is still typing in.
+        """
+        config = self._config()
+        key = (api_key or "").strip() or config.api_key
+        if not key:
+            raise OpenAIConfigError(
+                "No API key is configured. Add one in Provider settings or .env."
+            )
+        client = self._make_client(
+            key,
+            (base_url or "").strip() or config.base_url,
+            (user_agent or "").strip() or config.user_agent,
+        )
+        header = (session_header or "").strip() or config.session_header
+        kwargs: Dict[str, Any] = {}
+        if header:
+            kwargs["extra_headers"] = {header: "muse-model-list"}
+        response = await asyncio.to_thread(client.models.list, **kwargs)
+        ids = {
+            str(item.id)
+            for item in (getattr(response, "data", None) or [])
+            if getattr(item, "id", None)
+        }
+        return sorted(ids)
 
     # -- images -----------------------------------------------------------
     def generate_image(self, prompt: str, size: Optional[str] = None) -> Dict[str, str]:

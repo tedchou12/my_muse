@@ -16,7 +16,7 @@ import shlex
 import signal
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .config import Settings
 
@@ -135,6 +135,10 @@ SENSITIVE_PATH_ROOTS = (
     "/usr",
     "/var",
 )
+# `for p in "" "/blog" "/home/pricing"; do ...` is a list of string values
+# (usually URL paths), not file access. Mask the list so URL-path fragments
+# like /home/pricing do not look like sensitive filesystem paths.
+FOR_LIST_RE = re.compile(r"\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b[^;]*;")
 
 
 def _segments(command: str) -> List[List[str]]:
@@ -270,6 +274,8 @@ def _outside_path(candidate: str) -> bool:
 def _has_sensitive_path(command: str) -> bool:
     if re.search(r"(?i)\b(?:file|gopher|dict)://", command):
         return True
+    # Loop variable lists are string values, not file paths.
+    command = FOR_LIST_RE.sub(" ", command)
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
@@ -397,6 +403,7 @@ async def run_shell_command(
     cwd: str = "",
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     output_chars: int = DEFAULT_OUTPUT_CHARS,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     command = (command or "").strip()
     if not command:
@@ -407,10 +414,13 @@ async def run_shell_command(
     limit = max(1000, min(int(output_chars), MAX_OUTPUT_CHARS))
     working_dir = resolve_cwd(settings, cwd)
     started = time.monotonic()
+    env = shell_environment(settings)
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
     proc = await asyncio.create_subprocess_exec(
         *_argv(settings, command),
         cwd=str(working_dir),
-        env=shell_environment(settings),
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,

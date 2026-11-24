@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_status  TEXT,
     last_result  TEXT,
     run_count    INTEGER NOT NULL DEFAULT 0,
-    created_at   REAL NOT NULL
+    created_at   REAL NOT NULL,
+    agent_id     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS agents (
     role         TEXT NOT NULL DEFAULT '',
     instructions TEXT NOT NULL DEFAULT '',
     model        TEXT NOT NULL DEFAULT '',
+    trusted_commands TEXT NOT NULL DEFAULT '[]',
     status       TEXT NOT NULL DEFAULT 'active',
     created_by   TEXT NOT NULL DEFAULT 'user',
     created_at   REAL NOT NULL,
@@ -231,6 +233,18 @@ class Database:
         if "otp_selector" not in credential_columns:
             self._conn.execute(
                 "ALTER TABLE credential_requests ADD COLUMN otp_selector TEXT NOT NULL DEFAULT ''"
+            )
+        task_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")
+        }
+        if "agent_id" not in task_columns:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN agent_id INTEGER")
+        agent_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(agents)")
+        }
+        if "trusted_commands" not in agent_columns:
+            self._conn.execute(
+                "ALTER TABLE agents ADD COLUMN trusted_commands TEXT NOT NULL DEFAULT '[]'"
             )
 
     # -- low level --------------------------------------------------------

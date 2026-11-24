@@ -17,7 +17,9 @@ class FakeBrowser:
     def status(self, session: str = "default") -> Dict[str, Any]:
         return {"enabled": True, "started": True, "url": self.url}
 
-    async def click(self, target: str, session: str = "default") -> Dict[str, Any]:
+    async def click(
+        self, target: str, session: str = "default", kind: str = "auto"
+    ) -> Dict[str, Any]:
         self.clicks += 1
         return {"url": self.url, "title": "Page", "text": "clicked"}
 
@@ -27,6 +29,7 @@ class FakeBrowser:
         text: str,
         submit: bool = False,
         session: str = "default",
+        kind: str = "auto",
     ):
         return {"url": self.url, "title": "Page", "text": "typed"}
 

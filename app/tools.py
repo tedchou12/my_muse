@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .services import Services
@@ -28,8 +28,8 @@ from .shell import (
     shell_command_family,
     shell_command_signature,
 )
-from .team import parse_chat_context
-from .vault import host_matches
+from .team import TeamError, parse_chat_context
+from .vault import EntryNotFound, VaultLocked, host_matches
 
 TOOL_TIMEOUT_SECONDS = 180
 BROWSER_WRITE_TOOLS = {
@@ -39,6 +39,46 @@ BROWSER_WRITE_TOOLS = {
     "vault_fill",
 }
 BROWSER_ROUTINE_TOOLS = {"browser_click", "browser_type", "browser_press"}
+
+SECRET_PLACEHOLDER_RE = re.compile(r"\{\{\s*secret:\s*([^{}]+?)\s*\}\}")
+SECRET_FIELDS = ("password", "username", "notes", "url", "totp_secret")
+MIN_REDACT_CHARS = 4
+
+
+def _resolve_shell_secrets(
+    services: Services, command: str
+) -> Tuple[str, Dict[str, str], List[str]]:
+    """Swap {{secret:Label[.field]}} placeholders for injected env references.
+
+    Returns the rewritten command (no secrets), the environment additions and
+    the resolved values (for output redaction). Raises VaultLocked /
+    EntryNotFound / ValueError so the caller can explain what is missing.
+    """
+    env: Dict[str, str] = {}
+    values: List[str] = []
+    counter = {"next": 0}
+
+    def replace(match: "re.Match[str]") -> str:
+        raw = match.group(1).strip()
+        label = raw
+        field = "password"
+        if "." in raw:
+            candidate_label, _, candidate_field = raw.rpartition(".")
+            if candidate_field.strip().lower() in SECRET_FIELDS:
+                label = candidate_label.strip()
+                field = candidate_field.strip().lower()
+        secret = services.vault.get_secret_by_label(label)
+        value = str(secret.get(field) or "")
+        if not value:
+            raise ValueError("Vault entry %r has no %s value." % (label, field))
+        counter["next"] += 1
+        key = "MUSE_SECRET_%d" % counter["next"]
+        env[key] = value
+        values.append(value)
+        return "$" + key
+
+    resolved = SECRET_PLACEHOLDER_RE.sub(replace, command)
+    return resolved, env, values
 
 
 def _browser_session(chat_id: str) -> str:
@@ -158,12 +198,41 @@ class ToolKit:
         kind = str(args.get("kind", "")).strip()
         schedule = str(args.get("schedule", "")).strip()
         timezone = str(args.get("timezone") or "").strip() or None
-        task = self.services.scheduler.create(title, prompt, kind, schedule, timezone)
+        agent_id = None
+        agent_name = ""
+        raw_agent = args.get("agent_id") or args.get("agent")
+        if raw_agent:
+            try:
+                agent = self._resolve_team_agent({"agent": raw_agent})
+            except (ValueError, TeamError) as exc:
+                available = ", ".join(
+                    "%s (#%s)" % (item.get("name"), item.get("id"))
+                    for item in self.services.team.list_agents()
+                )
+                raise ValueError(
+                    "Unknown agent %r. Active agents: %s"
+                    % (raw_agent, available or "(none)")
+                ) from exc
+            if agent.get("status") != "active":
+                raise ValueError(
+                    "Agent %s is not active." % (agent.get("name") or raw_agent)
+                )
+            agent_id = int(agent["id"])
+            agent_name = agent.get("name") or ""
+        task = self.services.scheduler.create(
+            title, prompt, kind, schedule, timezone, agent_id=agent_id
+        )
         return {
             "task_id": task["id"],
             "title": task["title"],
             "kind": task["kind"],
             "next_run_at": task["next_run_at"],
+            "agent": agent_name,
+            "message": (
+                ("Runs as %s and its pinned model." % agent_name)
+                if agent_name
+                else "Runs as Muse with the provider's default model."
+            ),
         }
 
     async def list_tasks(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -179,6 +248,7 @@ class ToolKit:
                     "active": bool(task["active"]),
                     "next_run_at": task["next_run_at"],
                     "last_status": task["last_status"],
+                    "agent": task.get("agent_name") or "",
                 }
                 for task in tasks[:40]
             ]
@@ -232,23 +302,62 @@ class ToolKit:
             1,
             120,
         )
+        extra_env: Dict[str, str] = {}
+        secret_values: List[str] = []
+        if SECRET_PLACEHOLDER_RE.search(command):
+            try:
+                command, extra_env, secret_values = _resolve_shell_secrets(
+                    self.services, command
+                )
+            except VaultLocked:
+                return {
+                    "error": (
+                        "The vault is locked. Unlock it in the Vault tab, then "
+                        "retry; {{secret:Label}} placeholders cannot be resolved "
+                        "while it is locked."
+                    )
+                }
+            except EntryNotFound as exc:
+                try:
+                    labels = ", ".join(
+                        entry["label"] for entry in self.services.vault.list_entries()
+                    ) or "(none yet)"
+                except Exception:
+                    labels = "(unavailable)"
+                return {"error": "%s Available labels: %s" % (exc, labels)}
+            except ValueError as exc:
+                return {"error": str(exc)}
         try:
-            return await run_shell_command(
+            result = await run_shell_command(
                 self.services.settings,
                 command,
                 cwd=cwd,
                 timeout_seconds=timeout,
+                extra_env=extra_env or None,
             )
         except ShellError as exc:
             return {"error": str(exc)}
         except Exception as exc:
             return {"error": "%s: %s" % (type(exc).__name__, exc)}
+        if secret_values:
+            # Best effort: the model must never read a resolved secret back.
+            for field_name in ("stdout", "stderr", "command"):
+                text = str(result.get(field_name) or "")
+                for secret in secret_values:
+                    if secret and len(secret) >= MIN_REDACT_CHARS:
+                        text = text.replace(secret, "[redacted]")
+                result[field_name] = text
+            result["secrets_used"] = len(secret_values)
+        return result
 
     # -- browser ----------------------------------------------------------
     async def browser_open(self, args: Dict[str, Any], chat_id: str) -> Any:
         url = _require_text(args, "url", 2048)
+        allow_private = bool(self.services.prefs.get("browser_allow_private")) or bool(
+            self.services.settings.browser_allow_private_networks
+        )
         return await self.services.browser.open(
-            url, session=_browser_session(chat_id)
+            url, session=_browser_session(chat_id), allow_private=allow_private
         )
 
     async def browser_read(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -271,16 +380,18 @@ class ToolKit:
 
     async def browser_click(self, args: Dict[str, Any], chat_id: str) -> Any:
         target = _require_text(args, "target", 500)
+        kind = str(args.get("kind") or "auto").strip().lower()[:20]
         return await self.services.browser.click(
-            target, session=_browser_session(chat_id)
+            target, session=_browser_session(chat_id), kind=kind
         )
 
     async def browser_type(self, args: Dict[str, Any], chat_id: str) -> Any:
         selector = _require_text(args, "selector", 500)
         text = str(args.get("text", ""))[:4000]
         submit = bool(args.get("submit", False))
+        kind = str(args.get("kind") or "auto").strip().lower()[:20]
         return await self.services.browser.type_text(
-            selector, text, submit, session=_browser_session(chat_id)
+            selector, text, submit, session=_browser_session(chat_id), kind=kind
         )
 
     async def browser_press(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -564,16 +675,25 @@ class ToolKit:
         brief = _require_text(args, "brief")
         name = str(args.get("name") or "").strip()[:60] or None
         role = str(args.get("role") or "").strip()[:200] or None
+        model = str(args.get("model") or "").strip()[:160] or None
         me = self._team_agent(chat_id)
         created_by = "agent:%d" % me if me else "user"
         agent = await self.services.team.create_from_prompt(
-            brief, name=name, role=role, created_by=created_by
+            brief, name=name, role=role, created_by=created_by, model=model
         )
         return {
             "agent_id": agent["id"],
             "name": agent["name"],
             "role": agent["role"],
             "status": agent["status"],
+            "model": agent.get("model") or "",
+            "message": (
+                "Created %s. It runs on %s."
+                % (
+                    agent["name"],
+                    agent.get("model") or "the provider's default model",
+                )
+            ),
         }
 
     async def assign_task(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -636,8 +756,6 @@ class ToolKit:
             raw = args.get("agent_id") or args.get("agent")
             if raw:
                 me = int(self._resolve_team_agent({"agent": raw})["id"])
-        if not me:
-            raise ValueError("read_inbox is only available while an agent runs.")
         rows = self.services.team.inbox(
             me,
             limit=_clamp_int(args.get("limit"), 10, 1, 50),
@@ -646,6 +764,7 @@ class ToolKit:
         )
         return {
             "agent_id": me,
+            "inbox": "agent" if me else "muse",
             "messages": [
                 {
                     "from": row.get("from_name") or "User",
@@ -687,6 +806,7 @@ class ToolKit:
                     "status": row["status"],
                     "parent_task_id": row["parent_task_id"],
                     "result": (row.get("result") or "")[:1000],
+                    "error": (row.get("error") or "")[:1000],
                     "created_at": row["created_at"],
                 }
                 for row in rows
@@ -736,8 +856,10 @@ class ToolKit:
                 description=(
                     "Create a new named specialist from a plain-language brief. "
                     "Muse designs the name, role and standing instructions. The "
-                    "new agent can receive tasks. Creation is audited and capped "
-                    "by TEAM_MAX_AGENTS."
+                    "new agent can receive tasks. Optionally pin a model id "
+                    "(e.g. a cheaper model) for this agent; omit it to use the "
+                    "provider default. Creation is audited and capped by "
+                    "TEAM_MAX_AGENTS."
                 ),
                 parameters=_obj(
                     {
@@ -747,6 +869,11 @@ class ToolKit:
                         ),
                         "name": _str("Optional exact name."),
                         "role": _str("Optional one-line role override."),
+                        "model": _str(
+                            "Optional model id for this agent (use list of "
+                            "models from provider if unsure). Empty = provider "
+                            "default."
+                        ),
                     },
                     ["brief"],
                 ),
@@ -900,7 +1027,9 @@ class ToolKit:
                     "takes an ISO datetime like 2026-12-01T09:30, kind='interval' "
                     "takes seconds or values like 30m/2h/1d (minimum 60s), "
                     "kind='cron' takes a 5-field cron expression such as "
-                    "'0 8 * * 1-5'. The prompt is sent to you when the task fires."
+                    "'0 8 * * 1-5'. The prompt is sent to you when the task fires. "
+                    "Optionally assign the task to a named agent, which then runs "
+                    "it with that agent's pinned model (useful for cheap models)."
                 ),
                 parameters=_obj(
                     {
@@ -909,6 +1038,10 @@ class ToolKit:
                         "kind": _str("Schedule type.", ["once", "interval", "cron"]),
                         "schedule": _str("Datetime, duration or cron expression."),
                         "timezone": _str("Optional IANA timezone, e.g. Europe/Berlin."),
+                        "agent": _str(
+                            "Optional agent id or name to run this task as; "
+                            "omit to run as Muse with the default model."
+                        ),
                     },
                     ["title", "prompt", "kind", "schedule"],
                 ),
@@ -970,12 +1103,35 @@ class ToolKit:
             "browser_click": ToolSpec(
                 name="browser_click",
                 description=(
-                    "Click an element by CSS selector, or by its visible text if "
-                    "the selector does not match. This changes page state and "
-                    "needs approval."
+                    "Click an element by CSS selector, ARIA role, label, "
+                    "placeholder, visible text, or input value/alt/title — Muse "
+                    "tries all of these across the page and its iframes and uses "
+                    "the first visible match. A blocked click retries with force "
+                    "and after pressing Escape, so overlays/backdrops are less "
+                    "likely to stop it. This changes page state and needs "
+                    "approval."
                 ),
                 parameters=_obj(
-                    {"target": _str("CSS selector or visible text.")}, ["target"]
+                    {
+                        "target": _str(
+                            "CSS selector, visible text, label, placeholder or "
+                            "button value, e.g. 'Confirm' or '#submit'."
+                        ),
+                        "kind": _str(
+                            "Optional match strategy: auto (default), css, text, "
+                            "label, placeholder, role, value.",
+                            [
+                                "auto",
+                                "css",
+                                "text",
+                                "label",
+                                "placeholder",
+                                "role",
+                                "value",
+                            ],
+                        ),
+                    },
+                    ["target"],
                 ),
                 handler=self.browser_click,
                 side_effect=True,
@@ -983,14 +1139,32 @@ class ToolKit:
             "browser_type": ToolSpec(
                 name="browser_type",
                 description=(
-                    "Type into an input identified by CSS selector, optionally "
-                    "pressing Enter. Needs approval."
+                    "Type into an input found by CSS selector, label, "
+                    "placeholder, visible text or ARIA role (searched across the "
+                    "page and its iframes), optionally pressing Enter. Needs "
+                    "approval."
                 ),
                 parameters=_obj(
                     {
-                        "selector": _str("CSS selector of the input."),
+                        "selector": _str(
+                            "CSS selector, label, placeholder or visible text of "
+                            "the input."
+                        ),
                         "text": _str("Text to type."),
                         "submit": {"type": "boolean", "description": "Press Enter."},
+                        "kind": _str(
+                            "Optional match strategy: auto (default), css, text, "
+                            "label, placeholder, role, value.",
+                            [
+                                "auto",
+                                "css",
+                                "text",
+                                "label",
+                                "placeholder",
+                                "role",
+                                "value",
+                            ],
+                        ),
                     },
                     ["selector", "text"],
                 ),
@@ -1008,7 +1182,9 @@ class ToolKit:
                 name="vault_list",
                 description=(
                     "List vault entry labels and their allowed domains. Secret "
-                    "values are never available to you."
+                    "values are never available to you. To use a stored secret in "
+                    "a shell command, pass a {{secret:Label}} placeholder to "
+                    "run_shell instead of asking for the value."
                 ),
                 parameters=_obj({}),
                 handler=self.vault_list,
@@ -1078,8 +1254,9 @@ class ToolKit:
                     "be domain-bound to the current site, the vault must be unlocked "
                     "by the user, and this always needs approval. Omit label to use "
                     "the entry bound to the current hostname; omit selectors to "
-                    "auto-detect the visible login fields. You never see the "
-                    "username or password."
+                    "auto-detect the visible login fields. It handles both "
+                    "single-page forms and two-step username/next/password forms. "
+                    "You never see the username or password."
                 ),
                 parameters=_obj(
                     {
@@ -1111,8 +1288,13 @@ class ToolKit:
                     "without approval; install commands and unsafe paths or "
                     "non-GET downloads require approval and are remembered after "
                     "approval. Approving one curl command trusts all later curl "
-                    "variations. Never put passwords or API tokens inline; store "
-                    "credentials in the vault and pass them via a safe mechanism."
+                    "variations. Never put passwords or API tokens inline. To use "
+                    "a stored secret without seeing it, write a vault placeholder "
+                    "such as {{secret:Label}} (or {{secret:Label.username}}, "
+                    ".notes, .url, .totp_secret) inside the command; Muse injects "
+                    "the value as a temporary environment variable at run time, "
+                    "the output is redacted, and any command with a placeholder "
+                    "needs approval unless the exact command is trusted."
                 ),
                 parameters=_obj(
                     {
@@ -1200,11 +1382,15 @@ def summarise(tool: str, args: Dict[str, Any]) -> str:
     if tool == "generate_image":
         return "Generate image: %s" % str(args.get("prompt", ""))[:140]
     if tool == "schedule_task":
-        return "Schedule %r (%s: %s)" % (
+        summary = "Schedule %r (%s: %s)" % (
             str(args.get("title", ""))[:80],
             args.get("kind", ""),
             args.get("schedule", ""),
         )
+        agent = args.get("agent_id") or args.get("agent")
+        if agent:
+            summary += " as agent %s" % str(agent)[:80]
+        return summary
     if tool == "create_agent":
         return "Create agent: %s" % str(args.get("brief", ""))[:160]
     if tool == "rename_self":
@@ -1233,6 +1419,47 @@ def summarise(tool: str, args: Dict[str, Any]) -> str:
             str(args.get("domain") or "the requested site")[:160]
         )
     return "%s %s" % (tool, json.dumps(_redact(args), ensure_ascii=False)[:200])
+
+
+def _team_agent_for_chat(services: Services, chat_id: str) -> Optional[int]:
+    try:
+        me, _task = parse_chat_context(chat_id)
+    except Exception:
+        return None
+    return int(me) if me else None
+
+
+def _agent_trusted_commands(services: Services, agent_id: int) -> List[str]:
+    try:
+        agent = services.team.get_agent(int(agent_id))
+    except Exception:
+        return []
+    raw = agent.get("trusted_commands")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()][:50]
+
+
+def _agent_command_trusted(command: str, patterns: List[str]) -> bool:
+    """Match a command against an agent's trusted prefixes (trailing * = prefix)."""
+    text = " ".join(str(command or "").split())
+    if not text:
+        return False
+    for pattern in patterns:
+        candidate = " ".join(str(pattern or "").split())
+        if not candidate:
+            continue
+        if candidate.endswith("*"):
+            if text.startswith(candidate[:-1]):
+                return True
+        elif text == candidate:
+            return True
+    return False
 
 
 async def execute_tool(
@@ -1270,6 +1497,16 @@ async def execute_tool(
                 "unsafe downloads need approval."
             )
         }
+    if (name in BROWSER_WRITE_TOOLS or name == "browser_open") and str(
+        services.prefs.get("browser_control") or "agent"
+    ) == "user":
+        services.audit.log(actor, "tool_denied", {"tool": name, "reason": "user_has_browser"}, "denied")
+        return {
+            "error": (
+                "The user has taken manual control of the browser. Do not retry; "
+                "wait until they release control."
+            )
+        }
     needs_approval = spec.always_approve or (spec.side_effect and not auto)
     if name in BROWSER_ROUTINE_TOOLS and auto_browser:
         needs_approval = False
@@ -1294,7 +1531,24 @@ async def execute_tool(
         reason = shell_approval_reason(command)
         family = shell_command_family(command)
         family_hit = bool(family and family in families and reason == "download")
-        needs_approval = bool(reason) and not trusted_hit and not family_hit
+        # Placeholders resolve to real vault secrets at run time, so any command
+        # that uses one is a consequential action by default.
+        has_secrets = bool(SECRET_PLACEHOLDER_RE.search(command))
+        needs_approval = (
+            bool(reason) or has_secrets
+        ) and not trusted_hit and not family_hit
+        if needs_approval and not approved and not spec.always_approve:
+            me = _team_agent_for_chat(services, chat_id)
+            if me is not None:
+                patterns = _agent_trusted_commands(services, me)
+                if _agent_command_trusted(command, patterns):
+                    services.audit.log(
+                        actor,
+                        "tool_trusted_agent_command",
+                        {"tool": name, "agent_id": me},
+                        "ok",
+                    )
+                    needs_approval = False
     host = _current_host(services, chat_id) if name in BROWSER_WRITE_TOOLS else ""
     if (
         needs_approval

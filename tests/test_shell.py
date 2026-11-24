@@ -2,7 +2,26 @@ from __future__ import annotations
 
 import pytest
 
-from app.shell import ShellError, resolve_cwd, shell_needs_approval
+from app.shell import (
+    ShellError,
+    resolve_cwd,
+    shell_approval_reason,
+    shell_needs_approval,
+)
+
+
+def test_url_recon_loops_need_no_approval():
+    command = (
+        'for p in "" "/blog" "/home/pricing"; do '
+        'url="https://www.3d-products.com${p}"; '
+        'curl -s -o /dev/null -w "%{http_code}\\n" "$url"; done'
+    )
+    assert shell_approval_reason(command) == ""
+
+
+def test_real_sensitive_paths_still_need_approval():
+    assert shell_approval_reason('cat "/home/pwuser/.bashrc"') == "path"
+    assert shell_approval_reason("cat /etc/passwd") == "path"
 from app.tools import execute_approved, execute_tool
 
 

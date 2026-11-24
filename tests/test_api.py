@@ -507,6 +507,46 @@ def test_csp_allows_configured_frame_sources(settings):
     assert "frame-ancestors 'none'" in csp
 
 
+def test_csp_allows_request_host_for_vnc_view(settings):
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    settings.browser_vnc_url = "http://192.168.1.6:6080/vnc.html?autoconnect=1"
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/healthz", headers={"Host": "muse.example.test"})
+    csp = response.headers["Content-Security-Policy"]
+    assert "http://192.168.1.6:6080" in csp  # configured origin stays allowed
+    assert "http://muse.example.test:6080" in csp  # request host added
+
+
+def test_browser_status_view_url_follows_request_host(app, auth_client):
+    services = app.state.services
+    services.settings.browser_vnc_url = (
+        "http://192.168.1.6:6080/vnc.html?autoconnect=1"
+    )
+    status = auth_client.get(
+        "/api/browser/status", headers={"Host": "muse.example.test"}
+    ).json()
+    assert status["view_url"] == (
+        "http://muse.example.test:6080/vnc.html?autoconnect=1&view_only=1"
+    )
+
+    plain = auth_client.get("/api/browser/status").json()
+    # The request's Host header is always present in real traffic, so the
+    # rewrite applies there too (TestClient sends "testserver"), and the view
+    # stays view-only until the user takes control.
+    assert plain["view_url"] == (
+        "http://testserver:6080/vnc.html?autoconnect=1&view_only=1"
+    )
+
+
+def test_static_assets_revalidate(auth_client):
+    response = auth_client.get("/static/app.js")
+    assert response.status_code == 200
+    assert response.headers.get("cache-control") == "no-cache"
+
+
 def test_csp_ignores_unsafe_frame_values(settings):
     settings.browser_vnc_url = "javascript:alert(1)"
     settings.csp_frame_src = "*, data:text/html,http://ok.example:6080/path"

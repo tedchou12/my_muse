@@ -231,6 +231,29 @@ main { min-width: 0; min-height: 0; }
 details.card summary { cursor: pointer; font-weight: 600; }
 details.card form { margin-top: 14px; }
 
+/* ---------- model picker menu ---------- */
+.model-menu {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid rgba(139, 124, 255, .35);
+  border-radius: 10px;
+  background: #12151d;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-menu button {
+  text-align: left;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.model-menu button:hover { background: rgba(139, 124, 255, .15); }
+
 .row { display: flex; gap: 10px; align-items: center; }
 .row.between { justify-content: space-between; }
 .row.wrap { flex-wrap: wrap; }

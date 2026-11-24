@@ -117,10 +117,13 @@ class Scheduler:
 
     def list_tasks(self) -> List[Dict[str, Any]]:
         return self.db.query(
-            "SELECT id, title, prompt, kind, schedule, timezone, active, "
-            "next_run_at, last_run_at, last_status, last_result, run_count, "
-            "created_at FROM tasks ORDER BY active DESC, "
-            "COALESCE(next_run_at, 1e18) ASC, id DESC"
+            "SELECT t.id, t.title, t.prompt, t.kind, t.schedule, t.timezone, "
+            "t.active, t.next_run_at, t.last_run_at, t.last_status, "
+            "t.last_result, t.run_count, t.created_at, t.agent_id, "
+            "a.name AS agent_name FROM tasks t "
+            "LEFT JOIN agents a ON a.id = t.agent_id "
+            "ORDER BY t.active DESC, "
+            "COALESCE(t.next_run_at, 1e18) ASC, t.id DESC"
         )
 
     def create(
@@ -130,6 +133,7 @@ class Scheduler:
         kind: str,
         schedule: str,
         timezone: Optional[str] = None,
+        agent_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         title = (title or "").strip()
         prompt = (prompt or "").strip()
@@ -141,13 +145,28 @@ class Scheduler:
         next_run = compute_next_run(kind, schedule, tz_name)
         task_id = self.db.insert(
             "INSERT INTO tasks (title, prompt, kind, schedule, timezone, active, "
-            "next_run_at, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
-            (title, prompt, kind, str(schedule).strip(), tz_name, next_run, now_ts()),
+            "next_run_at, created_at, agent_id) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                title,
+                prompt,
+                kind,
+                str(schedule).strip(),
+                tz_name,
+                next_run,
+                now_ts(),
+                int(agent_id) if agent_id else None,
+            ),
         )
         self.audit.log(
             "user",
             "task_create",
-            {"id": task_id, "title": title, "kind": kind, "schedule": schedule},
+            {
+                "id": task_id,
+                "title": title,
+                "kind": kind,
+                "schedule": schedule,
+                "agent_id": int(agent_id) if agent_id else None,
+            },
         )
         return self.get(task_id)
 

@@ -94,7 +94,7 @@ def build_services(settings: Settings) -> Services:
             "timezone": settings.scheduler_timezone,
         },
     )
-    vault = Vault(db, audit, idle_seconds=settings.vault_idle_lock_seconds)
+    vault = Vault(db, audit)
     browser = BrowserManager(settings, vault)
     providers = ProviderStore(db, settings, audit)
     credentials = CredentialRequestQueue(db, audit)
@@ -136,9 +136,9 @@ async def _housekeeping(services: Services) -> None:
     while True:
         await asyncio.sleep(60)
         try:
-            services.vault.status()  # enforces idle auto-lock
             services.approvals.expire_stale()
             services.credentials.expire_stale()
+            services.vault.status()  # enforces idle auto-lock
         except Exception:  # pragma: no cover - background best effort
             logger.exception("Muse housekeeping failed")
 
@@ -159,12 +159,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "Carry this out now and report the result. Do not ask follow-up "
             "questions." % (task["title"], task["kind"], task["prompt"])
         )
-        result = await agent.run(
+        actor = "task:%d" % task["id"]
+        runner: Agent = agent
+        raw_agent = task.get("agent_id")
+        if raw_agent:
+            try:
+                profile = services.team.get_agent(int(raw_agent))
+                if profile["status"] == "active":
+                    runner = Agent(services, profile=profile)
+            except Exception:
+                logger.exception(
+                    "Scheduled task %s: assigned agent unavailable", task["id"]
+                )
+        result = await runner.run(
             chat_id="task:%d" % task["id"],
             user_text=prompt,
-            actor="task:%d" % task["id"],
+            actor=actor,
         )
-        return str(result.get("reply", ""))
+        return str(result.get("reply") or "").strip() or "No reply."
 
     services.scheduler.runner = run_scheduled_task
 
@@ -200,12 +212,38 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.services = services
     app.state.agent = agent
     security_headers = build_security_headers(settings)
+    vnc_parsed = urlparse(settings.browser_vnc_url or "")
+    vnc_scheme = vnc_parsed.scheme if vnc_parsed.scheme in ("http", "https") else ""
+    vnc_port = vnc_parsed.port
 
     @app.middleware("http")
     async def security_headers_middleware(request, call_next):
         response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            # Always revalidate so a redeployed container serves fresh
+            # HTML/JS/CSS without users having to hard-refresh.
+            response.headers.setdefault("Cache-Control", "no-cache")
         for key, value in security_headers.items():
             response.headers.setdefault(key, value)
+        # The live noVNC view must load from whatever host the user reached
+        # Muse on, so extend the frame CSP with the request's own host while
+        # keeping the configured port. Browsers reject a frame whose origin
+        # is not in frame-src even when the URL itself is reachable.
+        if vnc_scheme:
+            request_host = urlparse("//" + (request.headers.get("host") or ""))
+            hostname = request_host.hostname
+            if hostname:
+                netloc = hostname
+                if ":" in netloc:
+                    netloc = "[%s]" % netloc
+                if vnc_port is not None:
+                    netloc += ":%d" % vnc_port
+                origin = "%s://%s" % (vnc_scheme, netloc)
+                csp = response.headers.get("Content-Security-Policy", "")
+                if origin not in csp and "frame-src " in csp:
+                    response.headers["Content-Security-Policy"] = csp.replace(
+                        "frame-src ", "frame-src %s " % origin, 1
+                    )
         return response
 
     app.include_router(router)

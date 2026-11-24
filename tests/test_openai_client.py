@@ -84,3 +84,29 @@ def test_image_client_can_use_separate_provider(monkeypatch, settings):
 def test_image_client_falls_back_to_main_client(settings):
     service = OpenAIService(settings)
     assert service.image_client() is service.client()
+
+
+async def test_chat_forwards_model_override(settings):
+    service = OpenAIService(settings)
+    dummy = DummyClient()
+    service.client = lambda: dummy
+
+    await service.achat(
+        [{"role": "user", "content": "hi"}], session_id="chat-42", model="cheap-x"
+    )
+    assert dummy.chat.completions.kwargs["model"] == "cheap-x"
+
+
+async def test_chat_falls_back_to_provider_model(settings):
+    settings.openai_text_model = "main-model"
+    service = OpenAIService(settings)
+    dummy = DummyClient()
+    service.client = lambda: dummy
+
+    await service.achat([{"role": "user", "content": "hi"}], session_id="chat-42")
+    assert dummy.chat.completions.kwargs["model"] == "main-model"
+
+    await service.achat(
+        [{"role": "user", "content": "hi"}], session_id="chat-42", model=""
+    )
+    assert dummy.chat.completions.kwargs["model"] == "main-model"

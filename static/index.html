@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Muse — AI agent team</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+  <link rel="alternate icon" href="/static/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -91,6 +94,13 @@
           <form id="bot-form" class="form-grid">
             <label>Name (optional)
               <input id="bot-name" maxlength="60" placeholder="e.g. Immigration Researcher">
+            </label>
+            <label>Model (optional)
+              <span class="row">
+                <input id="bot-model" maxlength="160" placeholder="provider default" style="flex:1 1 auto; width:auto">
+                <button type="button" id="bot-models-btn" class="ghost">List models</button>
+              </span>
+              <div id="bot-model-menu" class="model-menu hidden"></div>
             </label>
             <label class="wide">Brief
               <textarea id="bot-brief" rows="3" required maxlength="8000"
@@ -229,6 +239,7 @@
             <span id="browser-owner" class="badge">Muse</span>
             <span id="browser-cors" class="badge">CORS off</span>
             <span id="browser-state" class="badge">idle</span>
+            <button id="browser-control" class="ghost" type="button">Take control</button>
             <button id="browser-back-chat" class="ghost" type="button">Back to chat</button>
           </div>
         </header>
@@ -261,14 +272,14 @@
             <p class="muted small">Consequential actions wait here. Nothing runs until you say so.</p>
           </div>
         </header>
-        <h3 class="section-title">Credential requests</h3>
+        <h3 class="section-title">Action approvals <span id="approval-pending-count" class="pill hidden"></span></h3>
+        <div id="approval-list" class="list"></div>
+        <h3 class="section-title">Credential requests <span id="credential-pending-count" class="pill hidden"></span></h3>
         <div id="credential-list" class="list"></div>
         <h3 class="section-title">Trusted sites</h3>
         <div id="trusted-hosts" class="list"></div>
         <h3 class="section-title">Trusted shell commands</h3>
         <div id="trusted-commands" class="list"></div>
-        <h3 class="section-title">Action approvals</h3>
-        <div id="approval-list" class="list"></div>
         <h3 class="section-title">Recent decisions</h3>
         <div id="approval-history" class="list"></div>
       </section>
@@ -317,8 +328,13 @@
           </label>
           <label class="check wide"><input id="provider-clear-key" type="checkbox"> Clear saved API key</label>
 
-          <label>Text model
-            <input id="provider-model" required maxlength="160" placeholder="kimi-k3">
+          <label class="wide">Text model
+            <span class="row">
+              <input id="provider-model" required maxlength="160" placeholder="kimi-k3" style="flex:1 1 auto; width:auto">
+              <button type="button" id="provider-models-btn" class="ghost">List models</button>
+            </span>
+            <div id="provider-model-menu" class="model-menu hidden"></div>
+            <span id="provider-models-result" class="muted small"></span>
           </label>
           <label>Session header
             <input id="provider-session" maxlength="64" placeholder="x-opencode-session">
@@ -393,6 +409,7 @@
           <label class="check"><input id="set-write" type="checkbox"> Allow write actions</label>
           <label class="check"><input id="set-auto" type="checkbox"> Auto-approve writes (risky)</label>
           <label class="check"><input id="set-browser-auto" type="checkbox"> Auto-approve routine browser clicks, typing and key presses</label>
+          <label class="check"><input id="set-browser-lan" type="checkbox"> Let the browser open LAN / private-network addresses (e.g. 192.168.1.x)</label>
           <label class="check"><input id="set-shell" type="checkbox"> Allow shell commands (normal workspace commands run directly; installs, paths outside the workspace, and non-GET downloads need approval)</label>
           <div class="wide actions"><span id="set-models" class="muted small"></span><button class="primary" type="submit">Save settings</button></div>
         </form>

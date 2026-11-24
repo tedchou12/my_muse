@@ -23,7 +23,7 @@ import re
 import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from .config import Settings
 from .totp import TotpError, code as totp_code
@@ -161,26 +161,35 @@ LOGIN_FIELDS_JS = r"""
     }
     return parts.join(' > ');
   };
-  const passwords = Array.from(document.querySelectorAll('input[type="password"]')).filter(visible);
-  if (!passwords.length) return null;
-  const password = passwords[0];
-  const scope = password.closest('form') || document;
-  const inputs = Array.from(scope.querySelectorAll('input')).filter((el) =>
-    visible(el) && !['hidden','password','submit','button','checkbox','radio','file','image','reset']
-      .includes((el.type || 'text').toLowerCase())
-  );
-  const username = inputs.find((el) => /user|email|login|account|identifier|phone|mail/i.test(
-    [el.name, el.id, el.autocomplete, el.placeholder, el.getAttribute('aria-label')].join(' ')
-  )) || inputs.find((el) => ['text','email','tel'].includes((el.type || 'text').toLowerCase()));
+  const textInput = (el) => visible(el) && ![
+    'hidden', 'password', 'submit', 'button', 'checkbox', 'radio', 'file', 'image', 'reset'
+  ].includes((el.type || 'text').toLowerCase());
+  const usernameIn = (scope) => {
+    const inputs = Array.from(scope.querySelectorAll('input')).filter(textInput);
+    return inputs.find((el) => /user|email|login|account|identifier|phone|mail/i.test(
+      [el.name, el.id, el.autocomplete, el.placeholder, el.getAttribute('aria-label')].join(' ')
+    )) || inputs.find((el) => ['text', 'email', 'tel'].includes((el.type || 'text').toLowerCase()));
+  };
+  const password = Array.from(document.querySelectorAll('input[type="password"]')).find(visible) || null;
+  let username = null;
+  let scope = null;
+  if (password) {
+    scope = password.closest('form') || document;
+    username = usernameIn(scope);
+  } else {
+    username = usernameIn(document);
+    if (!username) return null;
+    scope = username.closest('form') || document;
+  }
   const submitButtons = Array.from(
-    scope.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])')
+    scope.querySelectorAll('button, input[type="submit"], [role="button"]')
   ).filter(visible);
   let submit = submitButtons.find((el) =>
-    /log ?in|sign ?in|submit|continue|next/i.test((el.innerText || el.value || ''))
+    /log ?in|sign ?in|submit|continue|next/i.test(el.innerText || el.value || '')
   );
   if (!submit) submit = submitButtons[0];
   if (!submit) {
-    submit = Array.from(document.querySelectorAll('button')).filter(visible).find((el) =>
+    submit = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible).find((el) =>
       /log ?in|sign ?in|submit|continue|next/i.test(el.innerText || '')
     );
   }
@@ -190,7 +199,7 @@ LOGIN_FIELDS_JS = r"""
     username: selectorFor(username),
     password: selectorFor(password),
     submit: selectorFor(submit),
-    form_action: (password.form && password.form.action) || ''
+    form_action: (scope && scope.action) || ''
   };
 }
 """
@@ -239,20 +248,62 @@ OTP_FIELDS_JS = r"""
     'input[name*="mfa" i]',
     'input[name*="code" i]',
     'input[id*="code" i]',
+    'input[name*="pin" i]',
+    'input[id*="pin" i]',
+    'input[aria-label*="one-time" i]',
+    'input[aria-label*="verification" i]',
+    'input[aria-label*="security code" i]',
+    'input[aria-label*="auth code" i]',
+    'input[aria-label*="code" i]',
+    'input[placeholder*="code" i]',
+    'input[placeholder*="verification" i]',
     'input[inputmode="numeric"]'
   ];
+  const describe = (el) =>
+    [
+      el.getAttribute('name'),
+      el.getAttribute('id'),
+      el.getAttribute('aria-label'),
+      el.getAttribute('placeholder'),
+      el.getAttribute('autocomplete'),
+      el.getAttribute('title')
+    ]
+      .filter(Boolean)
+      .join(' ');
+  const otpish = (el) => /otp|one.?time|verif|security ?code|auth(?:orization)? ?code|sms ?code|passcode|2fa|mfa|token/i.test(describe(el));
   let otp = null;
   for (const selector of selectors) {
     try {
       otp = Array.from(document.querySelectorAll(selector)).find((el) => {
         if (!visible(el) || el.disabled || el.readOnly) return false;
         if ((el.type || '').toLowerCase() === 'search') return false;
-        return selector !== 'input[inputmode="numeric"]' || (el.maxLength >= 4 && el.maxLength <= 10);
+        if (selector === 'input[inputmode="numeric"]') {
+          if (!(el.maxLength >= 4 && el.maxLength <= 10)) return false;
+          return otpish(el) || /code|verif|passcode/i.test(describe(el));
+        }
+        return true;
       }) || null;
       if (otp) break;
     } catch (e) {}
   }
+  if (!otp) {
+    try {
+      otp = Array.from(document.querySelectorAll('input')).find((el) => {
+        if (!visible(el) || el.disabled || el.readOnly) return false;
+        const type = (el.type || '').toLowerCase();
+        if (['hidden', 'checkbox', 'radio', 'search', 'submit', 'button', 'file'].includes(type)) return false;
+        return otpish(el) && (el.maxLength === -1 || (el.maxLength >= 4 && el.maxLength <= 10));
+      }) || null;
+    } catch (e) {}
+  }
   if (!otp) return null;
+  let segmented = false;
+  try {
+    if (otp.maxLength === 1) {
+      const group = Array.from(document.querySelectorAll('input[maxlength="1"]')).filter(visible);
+      if (group.length >= 4) segmented = true;
+    }
+  } catch (e) {}
   const scope = otp.closest('form') || document;
   const buttons = Array.from(
     scope.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])')
@@ -266,6 +317,7 @@ OTP_FIELDS_JS = r"""
     title: document.title,
     otp: selectorFor(otp),
     submit: selectorFor(submit),
+    segmented: segmented,
     text: (document.body.innerText || '').slice(0, 1200)
   };
 }
@@ -273,6 +325,62 @@ OTP_FIELDS_JS = r"""
 
 
 
+
+
+NEEDS_JS_JS = r"""
+() => ({
+  scripts: document.querySelectorAll('script').length,
+  text_length: document.body ? (document.body.innerText || '').trim().length : 0,
+  has_root: Boolean(document.querySelector('#root, #app, #__next, [data-reactroot], [ng-version]'))
+})
+"""
+
+
+TARGET_KINDS = ("auto", "css", "text", "label", "placeholder", "role", "value")
+ROLE_NAMES = (
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "tab",
+    "menuitem",
+    "option",
+    "searchbox",
+)
+
+
+def _css_attr_value(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def rewrite_view_host(url: str, host: Optional[str]) -> str:
+    """Rewrite a configured view URL's hostname with the caller's host.
+
+    The configured BROWSER_VNC_URL supplies the scheme, port and path; the
+    hostname is taken from the request's Host header so the live view keeps
+    working no matter which hostname or IP the user reached Muse on. Returns
+    the configured URL unchanged when there is nothing sensible to swap.
+    """
+    if not url:
+        return url
+    host = (host or "").strip().lower()
+    if not host or any(ch in host for ch in "/\\?#@ \t\r\n"):
+        return url
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return url
+    candidate = urlparse("//" + host)
+    new_host = candidate.hostname
+    if not new_host:
+        return url
+    if ":" in new_host:  # IPv6 literal needs brackets in a netloc
+        new_host = "[%s]" % new_host
+    netloc = new_host
+    if parsed.port is not None:
+        netloc += ":%d" % parsed.port
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 class BrowserManager:
@@ -354,7 +462,9 @@ class BrowserManager:
         )
         self.failed_requests[:] = self.failed_requests[-120:]
 
-    def diagnostics(self, session: str = "default") -> Dict[str, Any]:
+    def diagnostics(
+        self, session: str = "default", request_host: Optional[str] = None
+    ) -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"
         return {
             "url": self._last_urls.get(session, self.last_url),
@@ -366,7 +476,9 @@ class BrowserManager:
             "cors_injections": self.cors_injections,
             "block_service_workers": self.settings.browser_block_service_workers,
             "remote": self._remote or bool(self.settings.browser_cdp_url),
-            "view_url": self.settings.browser_vnc_url,
+            "view_url": rewrite_view_host(
+                self.settings.browser_vnc_url, request_host
+            ),
         }
 
     # -- lifecycle --------------------------------------------------------
@@ -374,7 +486,9 @@ class BrowserManager:
     def enabled(self) -> bool:
         return bool(self.settings.browser_enabled)
 
-    def status(self, session: str = "default") -> Dict[str, Any]:
+    def status(
+        self, session: str = "default", request_host: Optional[str] = None
+    ) -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"
         page = self._pages.get(session)
         started = bool(page is not None and not page.is_closed())
@@ -398,7 +512,9 @@ class BrowserManager:
             "cors_domains": self.settings.cors_domains,
             "block_service_workers": self.settings.browser_block_service_workers,
             "remote": self._remote or bool(self.settings.browser_cdp_url),
-            "view_url": self.settings.browser_vnc_url,
+            "view_url": rewrite_view_host(
+                self.settings.browser_vnc_url, request_host
+            ),
             "session": session,
             "active_session": self._active_session,
             "sessions": sessions,
@@ -748,14 +864,18 @@ class BrowserManager:
             self.last_url = page.url
             return {"domain": host, "cleared": True, "reloaded": reloaded}
 
-    async def _checked_url(self, url: str) -> str:
+    async def _checked_url(
+        self, url: str, allow_private: Optional[bool] = None
+    ) -> str:
+        if allow_private is None:
+            allow_private = bool(self.settings.browser_allow_private_networks)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: validate_url(
                 url,
                 self.settings.allowed_domains,
-                self.settings.browser_allow_private_networks,
+                bool(allow_private),
                 True,
             ),
         )
@@ -794,8 +914,9 @@ class BrowserManager:
         url: str,
         session: str = "default",
         focus: bool = False,
+        allow_private: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        target = await self._checked_url(url)
+        target = await self._checked_url(url, allow_private=allow_private)
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
@@ -841,54 +962,187 @@ class BrowserManager:
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
-            text = await self._page_text(
-                page, max(200, min(int(max_chars), 20_000))
-            )
+            limit = max(200, min(int(max_chars), 20_000))
+            text = await self._page_text(page, limit)
+            frame_parts: List[str] = []
+            try:
+                frames = await self._frame_list(page)
+            except Exception:
+                frames = [page]
+            for frame in frames[1:]:
+                try:
+                    frame_text = await frame.inner_text("body")
+                except Exception:
+                    continue
+                frame_text = _collapse(frame_text, max(400, limit // 2))
+                if frame_text.strip():
+                    frame_parts.append("[frame %s]\n%s" % (frame.url, frame_text))
+            if frame_parts:
+                text = (text + "\n\n" + "\n\n".join(frame_parts))[: limit * 2 + 2000]
+            needs_js = False
+            if len(text.strip()) < 120:
+                try:
+                    info = await page.evaluate(NEEDS_JS_JS) or {}
+                    needs_js = bool(info.get("scripts")) and int(
+                        info.get("text_length") or 0
+                    ) < 120
+                except Exception:
+                    needs_js = False
             self._remember(session, page)
-            return {"url": page.url, "title": await page.title(), "text": text}
+            result: Dict[str, Any] = {
+                "url": page.url,
+                "title": await page.title(),
+                "text": text,
+            }
+            if needs_js:
+                note = (
+                    "This page rendered almost no text and is driven by JavaScript, "
+                    "so its content is invisible to browser_read. Prefer the site's "
+                    "API/JSON endpoints (check the network requests or <script> data), "
+                    "or open the live view for a human."
+                )
+                result["needs_javascript"] = True
+                result["note"] = note
+                result["text"] = (text + "\n\n[needs-JS] " + note).strip()
+            return result
 
-    async def click(self, target: str, session: str = "default") -> Dict[str, Any]:
+    async def _candidates(self, frame: Any, target: str, kind: str) -> List[Any]:
+        """Build locator candidates for one frame, ordered by reliability."""
+        target = str(target or "").strip()
+        if not target:
+            return []
+        candidates: List[Any] = []
+
+        def add(locator: Any) -> None:
+            if locator is not None:
+                candidates.append(locator)
+
+        if kind in ("auto", "css"):
+            try:
+                add(frame.locator(target))
+            except Exception:
+                pass
+        if kind in ("auto", "role"):
+            for role in ROLE_NAMES:
+                try:
+                    add(frame.get_by_role(role, name=target, exact=False))
+                except Exception:
+                    continue
+        if kind in ("auto", "label"):
+            try:
+                add(frame.get_by_label(target, exact=False))
+            except Exception:
+                pass
+        if kind in ("auto", "placeholder"):
+            try:
+                add(frame.get_by_placeholder(target, exact=False))
+            except Exception:
+                pass
+        if kind in ("auto", "text"):
+            try:
+                add(frame.get_by_text(target, exact=False))
+            except Exception:
+                pass
+        if kind in ("auto", "value"):
+            escaped = _css_attr_value(target)
+            for selector in (
+                'input[value="%s" i]' % escaped,
+                'input[alt="%s" i]' % escaped,
+                '[title="%s" i]' % escaped,
+                '[aria-label="%s" i]' % escaped,
+            ):
+                try:
+                    add(frame.locator(selector))
+                except Exception:
+                    continue
+        return candidates
+
+    async def _frame_list(self, page: Any) -> List[Any]:
+        frames: List[Any] = [page]
+        try:
+            main = page.main_frame
+            for frame in page.frames:
+                if frame is not main:
+                    frames.append(frame)
+        except Exception:
+            pass
+        return frames
+
+    async def _resolve_target(
+        self, page: Any, target: str, kind: str = "auto"
+    ) -> Tuple[Optional[Any], Optional[Any]]:
+        """Find a visible element for a target across the page and its iframes."""
+        kind = (kind or "auto").strip().lower()
+        if kind not in TARGET_KINDS:
+            kind = "auto"
+        fallback: Optional[Tuple[Any, Any]] = None
+        for frame in await self._frame_list(page):
+            for locator in await self._candidates(frame, target, kind):
+                try:
+                    if await locator.count() == 0:
+                        continue
+                except Exception:
+                    continue
+                first = locator.first
+                try:
+                    visible = await first.is_visible()
+                except Exception:
+                    visible = True
+                if visible:
+                    return frame, first
+                if fallback is None:
+                    fallback = (frame, first)
+        return fallback if fallback else (None, None)
+
+    async def click(
+        self, target: str, session: str = "default", kind: str = "auto"
+    ) -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
-            text_locator = page.get_by_text(target, exact=False).first
-            selector_locator = None
-            candidates = []
+            frame, locator = await self._resolve_target(page, target, kind)
+            if locator is None:
+                frame_count = len(await self._frame_list(page))
+                raise BrowserError(
+                    "No element matched %r on %s (searched %d frame(s) by CSS, "
+                    "role, label, placeholder, visible text and input value). "
+                    "Call browser_read to see the page text, or pass an explicit "
+                    "CSS selector with kind='css'."
+                    % (target, page.url, frame_count)
+                )
             try:
-                selector_locator = page.locator(target)
-                if await selector_locator.count() > 0:
-                    candidates.append(selector_locator.first)
-            except Exception:
-                selector_locator = None
-            try:
-                if await text_locator.count() > 0:
-                    candidates.append(text_locator)
+                await locator.scroll_into_view_if_needed(timeout=3_000)
             except Exception:
                 pass
-
             clicked = False
-            last_error: Optional[Exception] = None
-            for candidate in candidates:
+            errors: List[str] = []
+            for force in (False, True):
                 try:
-                    await candidate.scroll_into_view_if_needed(timeout=3_000)
-                except Exception:
-                    pass
-                try:
-                    await candidate.click(timeout=5_000)
+                    await locator.click(timeout=5_000, force=force)
                     clicked = True
                     break
                 except Exception as exc:
-                    last_error = exc
-
+                    errors.append(str(exc)[:240])
             if not clicked:
-                # If the text resolves to a link, follow its href directly.
-                href = None
+                # A backdrop or animation may own the pointer; dismiss, retry.
                 try:
-                    anchor = text_locator.locator("xpath=ancestor-or-self::a[1]")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    await locator.click(timeout=3_000, force=True)
+                    clicked = True
+                except Exception as exc:
+                    errors.append(str(exc)[:240])
+            if not clicked:
+                # If the matched text sits inside a link, follow its href.
+                href = ""
+                try:
+                    anchor = locator.locator("xpath=ancestor-or-self::a[1]")
                     if await anchor.count() > 0:
-                        href = await anchor.first.get_attribute("href", timeout=2_000)
+                        href = await anchor.first.get_attribute(
+                            "href", timeout=2_000
+                        ) or ""
                 except Exception:
-                    href = None
+                    href = ""
                 if href and not href.lower().startswith(
                     ("javascript:", "mailto:", "tel:", "#")
                 ):
@@ -900,40 +1154,28 @@ class BrowserManager:
                         )
                         clicked = True
                     except Exception as exc:
-                        last_error = exc
-
+                        errors.append(str(exc)[:240])
             if not clicked:
                 try:
-                    await text_locator.click(timeout=5_000, force=True)
+                    await locator.dispatch_event("click", timeout=3_000)
                     clicked = True
                 except Exception as exc:
-                    last_error = exc
-
-            if not clicked and selector_locator is not None:
-                try:
-                    await selector_locator.first.dispatch_event("click", timeout=3_000)
-                    clicked = True
-                except Exception as exc:
-                    last_error = exc
-
+                    errors.append(str(exc)[:240])
             if not clicked:
-                try:
-                    await text_locator.dispatch_event("click", timeout=3_000)
-                    clicked = True
-                except Exception as exc:
-                    last_error = exc
-
-            if not clicked:
+                hint = (
+                    "Hint: if a modal or cookie banner covers the page, close it "
+                    "first (click its close/confirm control, or press Escape via "
+                    "browser_press)."
+                )
                 raise BrowserError(
-                    "Could not click %r: %s"
-                    % (target, last_error or "no matching element")
-                ) from last_error
-
+                    "Could not click %r: %s %s"
+                    % (target, "; ".join(errors[-2:]) or "no match", hint)
+                )
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=3_000)
             except Exception:
                 pass
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.4)
             self._remember(session, page)
             return {
                 "url": page.url,
@@ -947,14 +1189,29 @@ class BrowserManager:
         text: str,
         submit: bool = False,
         session: str = "default",
+        kind: str = "auto",
     ) -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
+            frame, locator = await self._resolve_target(page, selector, kind)
+            if locator is None:
+                raise BrowserError(
+                    "No input matched %r (searched CSS, role, label, placeholder, "
+                    "visible text and value across %d frame(s))."
+                    % (selector, len(await self._frame_list(page)))
+                )
             try:
-                await page.fill(selector, text, timeout=10_000)
+                await locator.click(timeout=5_000)
+            except Exception:
+                pass
+            try:
+                await locator.fill(text, timeout=10_000)
                 if submit:
-                    await page.press(selector, "Enter")
+                    try:
+                        await locator.press("Enter", timeout=3_000)
+                    except Exception:
+                        await page.keyboard.press("Enter")
                     await asyncio.sleep(0.6)
             except Exception as exc:
                 raise BrowserError(
@@ -995,9 +1252,9 @@ class BrowserManager:
             info = await page.evaluate(LOGIN_FIELDS_JS)
         except Exception as exc:
             raise BrowserError("Could not inspect the page: %s" % exc) from exc
-        if not info or not info.get("password"):
+        if not info or not (info.get("username") or info.get("password")):
             raise BrowserError(
-                "No visible password field found. Open the login page first."
+                "No visible username or password field found. Open the login page first."
             )
         return info
 
@@ -1008,21 +1265,43 @@ class BrowserManager:
             page = await self._ensure_page(session)
             return await self._detect_login_locked(page)
 
+    async def _otp_fields(
+        self, page: Any
+    ) -> Tuple[Optional[Dict[str, Any]], Any]:
+        """Find a one-time-code challenge in the main page or a child frame."""
+        try:
+            info = await page.evaluate(OTP_FIELDS_JS)
+        except Exception:
+            info = None
+        if info:
+            return info, page
+        main_frame = getattr(page, "main_frame", None)
+        for frame in getattr(page, "frames", []) or []:
+            if frame is main_frame:
+                continue
+            try:
+                info = await frame.evaluate(OTP_FIELDS_JS)
+            except Exception:
+                continue
+            if info:
+                info = dict(info)
+                info["frame"] = True
+                return info, frame
+        return None, page
+
     async def detect_otp_fields(self, session: str = "default") -> Dict[str, Any]:
         """Return selectors for a visible one-time-code challenge."""
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
-            try:
-                info = await page.evaluate(OTP_FIELDS_JS)
-            except Exception as exc:
-                raise BrowserError("Could not inspect the OTP page: %s" % exc) from exc
+            info, _ = await self._otp_fields(page)
             if not info:
                 return {
                     "url": page.url,
                     "title": "",
                     "otp": "",
                     "submit": "",
+                    "segmented": False,
                     "text": await self._page_text(page, 1200),
                 }
             return info
@@ -1042,25 +1321,34 @@ class BrowserManager:
         async with self.lock:
             page = await self._ensure_page(session)
             selector = otp_selector.strip()
+            submit_selector = submit_selector.strip()
+            segmented = False
+            frame = page
             if not selector:
-                try:
-                    fields = await page.evaluate(OTP_FIELDS_JS)
-                except Exception as exc:
-                    raise BrowserError(
-                        "Could not inspect the OTP page: %s" % exc
-                    ) from exc
+                fields, frame = await self._otp_fields(page)
                 selector = str((fields or {}).get("otp") or "").strip()
                 submit_selector = submit_selector or str(
                     (fields or {}).get("submit") or ""
                 ).strip()
+                segmented = bool((fields or {}).get("segmented"))
             if not selector:
-                raise BrowserError("No visible one-time-code field was found.")
+                raise BrowserError(
+                    "No visible one-time-code field was found (checked the page and its frames)."
+                )
             try:
-                await page.fill(selector, code, timeout=10_000)
-                if submit_selector:
-                    await page.click(submit_selector, timeout=10_000)
+                if segmented:
+                    locator = frame.locator(selector).first
+                    await locator.click(timeout=10_000)
+                    try:
+                        await locator.press_sequentially(code, delay=60)
+                    except AttributeError:  # pragma: no cover - older Playwright
+                        await frame.keyboard.type(code, delay=60)
                 else:
-                    await page.press(selector, "Enter")
+                    await frame.fill(selector, code, timeout=10_000)
+                if submit_selector:
+                    await frame.click(submit_selector, timeout=10_000)
+                else:
+                    await frame.press(selector, "Enter")
                 await asyncio.sleep(1.0)
             except Exception as exc:
                 raise BrowserError("Could not submit the one-time code: %s" % exc) from exc
@@ -1166,23 +1454,74 @@ class BrowserManager:
         password_selector: str,
         submit_selector: str,
     ) -> Tuple[int, bool, str]:
-        if not password_selector:
-            raise BrowserError("Could not find a password field on this page.")
+        if not password_selector and not username_selector:
+            raise BrowserError(
+                "Could not find a username or password field on this page."
+            )
         filled = 0
         if username_selector and secret.get("username"):
             await page.fill(
                 username_selector, str(secret["username"]), timeout=10_000
             )
             filled += 1
+
+        if password_selector:
+            await page.fill(
+                password_selector, str(secret["password"]), timeout=10_000
+            )
+            filled += 1
+            if submit_selector:
+                await page.click(submit_selector, timeout=10_000)
+            else:
+                await page.press(password_selector, "Enter")
+            await asyncio.sleep(1.0)
+            return await self._finish_credential(page, secret, filled)
+
+        if not filled:
+            raise BrowserError(
+                "No visible username or password field was found on this page."
+            )
+
+        # Multi-step SSO: username/email first, then a password page.
+        if submit_selector:
+            await page.click(submit_selector, timeout=10_000)
+        else:
+            await page.press(username_selector, "Enter")
+        await asyncio.sleep(0.8)
+
+        fields: Dict[str, Any] = {}
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                info = await page.evaluate(LOGIN_FIELDS_JS)
+            except Exception:
+                info = None
+            if isinstance(info, dict) and info.get("password"):
+                fields = info
+                break
+            await asyncio.sleep(0.4)
+        if not fields.get("password"):
+            raise BrowserError(
+                "The username was submitted, but no password field appeared. "
+                "The next login step may need manual interaction."
+            )
+
+        password_selector = str(fields.get("password") or "")
         await page.fill(
             password_selector, str(secret["password"]), timeout=10_000
         )
         filled += 1
-        if submit_selector:
-            await page.click(submit_selector, timeout=10_000)
+        final_submit = str(fields.get("submit") or "")
+        if final_submit:
+            await page.click(final_submit, timeout=10_000)
         else:
             await page.press(password_selector, "Enter")
         await asyncio.sleep(1.0)
+        return await self._finish_credential(page, secret, filled)
+
+    async def _finish_credential(
+        self, page: Any, secret: Dict[str, Any], filled: int
+    ) -> Tuple[int, bool, str]:
         otp_submitted = False
         otp_error = ""
         try:
@@ -1226,7 +1565,7 @@ class BrowserManager:
             if not password_selector:
                 fields = await self._detect_login_locked(page)
                 username_selector = fields.get("username", "")
-                password_selector = fields["password"]
+                password_selector = fields.get("password", "")
                 submit_selector = fields.get("submit", "")
                 autodetected = True
 
@@ -1244,7 +1583,7 @@ class BrowserManager:
                 # Stored selectors may be stale after a redesign; detect once.
                 fields = await self._detect_login_locked(page)
                 username_selector = fields.get("username", "")
-                password_selector = fields["password"]
+                password_selector = fields.get("password", "")
                 submit_selector = fields.get("submit", "")
                 autodetected = True
                 try:

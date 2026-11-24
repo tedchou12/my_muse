@@ -22,8 +22,24 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-x11vnc -display "$DISPLAY" -forever -shared -nopw -rfbport 5900 -noxdamage -quiet &
+start_vnc() {
+  while true; do
+    # Xvfb can create its socket before it is ready to accept clients.
+    # Keep restarting x11vnc until the display is usable.
+    x11vnc -display "$DISPLAY" -forever -shared -nopw -rfbport 5900 -noxdamage -quiet || true
+    sleep 1
+  done
+}
+start_vnc &
 VNC_PID=$!
+
+# Let the VNC listener come up before starting the web socket proxy.
+for _ in $(seq 1 100); do
+  if (echo > /dev/tcp/127.0.0.1/5900) 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
 
 websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 &
 WS_PID=$!

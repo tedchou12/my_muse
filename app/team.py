@@ -85,6 +85,27 @@ def parse_chat_context(chat_id: str) -> Tuple[Optional[int], Optional[int]]:
         int(task_match.group(1)) if task_match else None,
     )
 
+def _clean_commands(values: Any) -> List[str]:
+    """Normalise a trusted-command list: unique, trimmed, capped."""
+    if isinstance(values, str):
+        text = values.strip()
+        if text.startswith("["):
+            try:
+                values = json.loads(text)
+            except (TypeError, ValueError):
+                values = [text]
+        else:
+            values = [text]
+    if not isinstance(values, (list, tuple)):
+        return []
+    items: List[str] = []
+    for raw in values[:50]:
+        text = _clean(raw, 200)
+        if text and text not in items:
+            items.append(text)
+    return items
+
+
 class TeamStore:
     def __init__(
         self,
@@ -136,10 +157,14 @@ class TeamStore:
         role: str,
         instructions: str,
         created_by: str = "user",
+        model: str = "",
+        trusted_commands: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         name = _clean(name, 60)
         role = _clean(role, 200)
         instructions = _clean(instructions, 8000) or role
+        model = _clean(model, 160)
+        trust = _clean_commands(trusted_commands)
         if not name or not role:
             raise TeamError("Agent name and role are required.")
         active = self.db.scalar(
@@ -156,14 +181,30 @@ class TeamStore:
             raise DuplicateAgent("An agent named %r already exists." % name)
         now = time.time()
         agent_id = self.db.insert(
-            "INSERT INTO agents (name, role, instructions, model, status, "
-            "created_by, created_at, updated_at) VALUES (?, ?, ?, '', 'active', ?, ?, ?)",
-            (name, role, instructions, _clean(created_by, 80), now, now),
+            "INSERT INTO agents (name, role, instructions, model, trusted_commands, "
+            "status, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                name,
+                role,
+                instructions,
+                model,
+                json.dumps(trust),
+                _clean(created_by, 80),
+                now,
+                now,
+            ),
         )
         self.audit.log(
             _clean(created_by, 80) or "user",
             "agent_created",
-            {"agent_id": agent_id, "name": name, "role": role},
+            {
+                "agent_id": agent_id,
+                "name": name,
+                "role": role,
+                "model": model,
+                "trusted_commands": trust,
+            },
         )
         return self.get_agent(agent_id)
 
@@ -172,8 +213,18 @@ class TeamStore:
     ) -> Dict[str, Any]:
         current = self.get_agent(agent_id)
         fields: Dict[str, Any] = {}
-        for key in ("name", "role", "instructions", "model", "status"):
+        for key in (
+            "name",
+            "role",
+            "instructions",
+            "model",
+            "status",
+            "trusted_commands",
+        ):
             if key in values and values[key] is not None:
+                if key == "trusted_commands":
+                    fields[key] = json.dumps(_clean_commands(values[key]))
+                    continue
                 limit = {
                     "name": 60,
                     "role": 200,
@@ -285,6 +336,8 @@ class TeamStore:
         name: Optional[str] = None,
         role: Optional[str] = None,
         created_by: str = "user",
+        model: Optional[str] = None,
+        trusted_commands: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         profile = await self.design_agent(brief)
         chosen_name = _clean(name, 60) or profile["name"]
@@ -294,6 +347,8 @@ class TeamStore:
             chosen_role,
             profile["instructions"],
             created_by=created_by,
+            model=model or "",
+            trusted_commands=trusted_commands,
         )
 
 
@@ -450,12 +505,10 @@ class TeamStore:
         kind: str = "result",
     ) -> None:
         creator = task.get("created_by_agent_id")
-        if not creator:
-            return
         try:
             self.send_message(
                 from_agent_id=task.get("agent_id"),
-                to_agent_id=int(creator),
+                to_agent_id=int(creator) if creator else None,
                 content=content,
                 task_id=int(task["id"]),
                 kind=kind,
@@ -510,9 +563,11 @@ class TeamStore:
             return task
         error = _clean(error, 4000) or "Task failed."
         self.db.execute(
-            "UPDATE agent_tasks SET status = 'failed', error = ?, finished_at = ? "
-            "WHERE id = ? AND status IN ('working','queued','needs_approval')",
-            (error, time.time(), int(task_id)),
+            "UPDATE agent_tasks SET status = 'failed', error = ?, "
+            "result = CASE WHEN result IS NULL OR result = '' THEN ? ELSE result END, "
+            "finished_at = ? WHERE id = ? "
+            "AND status IN ('working','queued','needs_approval')",
+            (error, error, time.time(), int(task_id)),
         )
         task = self.get_task(task_id)
         self.audit.log(
@@ -557,7 +612,7 @@ class TeamStore:
     def send_message(
         self,
         from_agent_id: Optional[int],
-        to_agent_id: int,
+        to_agent_id: Optional[int],
         content: str,
         task_id: Optional[int] = None,
         kind: str = "message",
@@ -566,7 +621,8 @@ class TeamStore:
         content = _clean(content, 8000)
         if not content:
             raise TeamError("Message cannot be empty.")
-        self.get_agent(to_agent_id)
+        if to_agent_id:
+            self.get_agent(to_agent_id)
         if from_agent_id:
             self.get_agent(from_agent_id)
         message_id = self.db.insert(
@@ -574,7 +630,7 @@ class TeamStore:
             "kind, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 int(from_agent_id) if from_agent_id else None,
-                int(to_agent_id),
+                int(to_agent_id) if to_agent_id else None,
                 int(task_id) if task_id else None,
                 _clean(kind, 40) or "message",
                 content,
@@ -584,7 +640,11 @@ class TeamStore:
         self.audit.log(
             actor or ("agent:%s" % from_agent_id if from_agent_id else "user"),
             "agent_message",
-            {"message_id": message_id, "to_agent_id": int(to_agent_id), "kind": kind},
+            {
+                "message_id": message_id,
+                "to_agent_id": int(to_agent_id) if to_agent_id else None,
+                "kind": kind,
+            },
         )
         return self.db.one(
             "SELECT m.*, COALESCE(f.name, 'User') AS from_name, "
@@ -596,13 +656,19 @@ class TeamStore:
 
     def inbox(
         self,
-        agent_id: int,
+        agent_id: Optional[int],
         limit: int = 20,
         unread_only: bool = False,
         mark_read: bool = False,
     ) -> List[Dict[str, Any]]:
-        self.get_agent(agent_id)
-        where = "m.to_agent_id = ?"
+        if agent_id:
+            self.get_agent(agent_id)
+            where = "m.to_agent_id = ?"
+            key: Any = int(agent_id)
+        else:
+            # Muse's own inbox: results and messages addressed to the user.
+            where = "m.to_agent_id IS NULL"
+            key = None
         if unread_only:
             where += " AND m.read_at IS NULL"
         rows = self.db.query(
@@ -613,7 +679,8 @@ class TeamStore:
             "LEFT JOIN agents t ON t.id = m.to_agent_id "
             "LEFT JOIN agent_tasks ta ON ta.id = m.task_id "
             "WHERE " + where + " ORDER BY m.id DESC LIMIT ?",
-            (int(agent_id), max(1, min(int(limit), 100))),
+            (key, max(1, min(int(limit), 100))) if key is not None
+            else (max(1, min(int(limit), 100)),),
         )
         if mark_read and rows:
             ids = [int(row["id"]) for row in rows if not row["read_at"]]
@@ -1085,7 +1152,11 @@ class TeamRunner:
         self.services.audit.log(
             "agent:%s" % agent["id"],
             "team_task_started",
-            {"task_id": int(task_id), "agent_id": int(agent["id"])},
+            {
+                "task_id": int(task_id),
+                "agent_id": int(agent["id"]),
+                "model": agent.get("model") or "",
+            },
         )
         try:
             timeout = float(self.services.settings.agent_run_timeout_seconds)
