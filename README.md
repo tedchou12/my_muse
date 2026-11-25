@@ -252,7 +252,7 @@ All settings are environment variables (or `.env`).
 | `BROWSER_ENABLED` | `true` | Enable Playwright tools. |
 | `BROWSER_HEADLESS` | `true` | Headless Chromium. |
 | `BROWSER_ALLOWED_DOMAINS` | empty | Comma-separated allowlist; empty = any public site. |
-| `BROWSER_ALLOW_PRIVATE_NETWORKS` | `false` | Allow private/LAN addresses in the browser (also toggleable per-install in Settings). Shell already reaches the LAN; keep this off unless you need it. |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | `false` | Allow private/LAN addresses for **all** browser traffic (pages, subresources, XHR), not just `browser_open`. Also toggleable in Settings. Shell already reaches the LAN; keep this off unless you need it. |
 | `BROWSER_CORS_MODE` | `off` | `off` or `inject`; inject adds CORS headers only for allowlisted origins. |
 | `BROWSER_CORS_DOMAINS` | empty | Comma-separated origins for `inject` mode, e.g. `github.com`. |
 | `BROWSER_BLOCK_SERVICE_WORKERS` | `false` | Block service workers so they cannot bypass CORS-header injection. |
@@ -484,6 +484,12 @@ operate on the same browser.
   the first visible match (`kind` pins one strategy). A blocked click retries
   with `force`, presses Escape for backdrops, then falls back to following an
   anchor's href. `browser_read` includes the text of child frames.
+- **Silent failures.** Clicks and form submits compare the page before and after:
+  when nothing changed you get `unchanged: true` plus a warning, so an expired
+  CSRF token that merely re-renders the form is no longer mistaken for success.
+- **LAN access.** With the private-network toggle on, every browser request
+  (page, assets, XHR) may reach private addresses, matching what `run_shell`
+  already can do. Blocked requests are listed in `GET /api/browser/diagnostics`.
 - `browser_read` flags JavaScript-only pages (`needs_javascript` / a `[needs-JS]`
   note in the text) so the agent switches to the site's API instead of guessing.
 - OTP detection covers `autocomplete="one-time-code"`, aria-label/placeholder
@@ -932,8 +938,19 @@ Deliberately out of scope for v0.1:
   approval gates. Each agent may pin its own model (e.g. a cheaper one) and its
   own **trusted shell commands** (exact strings or `prefix*`), which skip the
   approval prompt for that agent only; scheduled tasks can be assigned to an
-  agent and then run on that model. Muse itself can read teammate replies with
+  agent and then run on that model. The lead can read teammate replies with
   `read_inbox` from the normal chat, and agent task results land in that inbox.
+- The **team lead** is whatever name you set in Settings (formerly "Muse").
+  Teammates can message it by its current name (or "lead"/"team lead"), its
+  inbox is the normal chat, group threads show the current name, and it cannot
+  be a task assignee — agents report to it with `send_message`.
+- **Scheduled tasks carry their context.** When you schedule a task, the last
+  few chat turns are stored with it and injected into the prompt when it fires,
+  so an automation does not depend on chat memory it cannot see.
+- **Time and data hygiene.** `convert_time` converts any timestamp to ET and JST
+  (the system prompt requires reporting both); `file_info` reports a file's
+  mtime, age and a stale-file warning so an old local copy is never mistaken
+  for the live system.
   Sentinel rules. The `model` column is reserved for future per-agent routing
   and is not used yet.
 - **No Slack/Teams, meetings or per-bot computers yet.** The implementation

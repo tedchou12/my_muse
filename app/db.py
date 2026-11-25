@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_result  TEXT,
     run_count    INTEGER NOT NULL DEFAULT 0,
     created_at   REAL NOT NULL,
-    agent_id     INTEGER
+    agent_id     INTEGER,
+    context      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -239,6 +240,10 @@ class Database:
         }
         if "agent_id" not in task_columns:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN agent_id INTEGER")
+        if "context" not in task_columns:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN context TEXT NOT NULL DEFAULT ''"
+            )
         agent_columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(agents)")
         }

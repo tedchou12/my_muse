@@ -17,8 +17,11 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from .services import Services
 from .shell import (
@@ -27,6 +30,7 @@ from .shell import (
     shell_approval_reason,
     shell_command_family,
     shell_command_signature,
+    workspace_path,
 )
 from .team import TeamError, parse_chat_context
 from .vault import EntryNotFound, VaultLocked, host_matches
@@ -191,7 +195,80 @@ class ToolKit:
             "filename": saved["filename"],
         }
 
+    # -- utilities --------------------------------------------------------
+    async def convert_time(self, args: Dict[str, Any], chat_id: str) -> Any:
+        raw = str(args.get("timestamp") or "").strip()
+        source_tz = str(args.get("from_timezone") or "").strip() or str(
+            self.services.prefs.get("timezone")
+            or self.services.settings.scheduler_timezone
+            or "UTC"
+        )
+        moment = _parse_moment(raw, source_tz)
+        et = moment.astimezone(ZoneInfo("America/New_York"))
+        jst = moment.astimezone(ZoneInfo("Asia/Tokyo"))
+        return {
+            "epoch": moment.timestamp(),
+            "utc": moment.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            "et": et.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "jst": jst.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "source_timezone": source_tz,
+            "note": "When reporting times, always state both ET and JST.",
+        }
+
+    async def file_info(self, args: Dict[str, Any], chat_id: str) -> Any:
+        raw = _require_text(args, "path", 500)
+        base = workspace_path(self.services.settings)
+        target = Path(raw)
+        if not target.is_absolute():
+            target = base / target
+        try:
+            target = target.resolve()
+            target.relative_to(base)
+        except (OSError, ValueError):
+            raise ValueError(
+                "file_info only inspects files inside the shell workspace (%s). "
+                "Use run_shell `ls -la` for other paths." % base
+            )
+        if not target.exists():
+            return {"path": str(target), "exists": False}
+        stat = target.stat()
+        age = max(0.0, time.time() - stat.st_mtime)
+        result: Dict[str, Any] = {
+            "path": str(target),
+            "exists": True,
+            "is_dir": target.is_dir(),
+            "size": stat.st_size,
+            "mtime_epoch": stat.st_mtime,
+            "mtime_utc": datetime.fromtimestamp(
+                stat.st_mtime, timezone.utc
+            ).isoformat(timespec="seconds"),
+            "age_seconds": int(age),
+            "age_human": _human_age(age),
+        }
+        if target.is_file() and age > 7 * 86400:
+            result["stale_warning"] = (
+                "This file is over a week old. Do not conclude that a pipeline "
+                "or service is down from this copy; confirm the live path or "
+                "endpoint first."
+            )
+        return result
+
     # -- scheduling -------------------------------------------------------
+    def _schedule_context(self, chat_id: str) -> str:
+        """Snapshot recent chat turns so the scheduled run carries its context."""
+        try:
+            history = self.services.agent.history(chat_id, limit=8)
+        except Exception:
+            return ""
+        lines: List[str] = []
+        for message in history[-6:]:
+            role = str(message.get("role") or "user")
+            content = str(message.get("content") or "").strip()
+            if not content or role == "tool":
+                continue
+            lines.append("%s: %s" % (role, content[:300]))
+        return "\n".join(lines)[-2500:]
+
     async def schedule_task(self, args: Dict[str, Any], chat_id: str) -> Any:
         title = _require_text(args, "title", 120)
         prompt = _require_text(args, "prompt")
@@ -220,7 +297,13 @@ class ToolKit:
             agent_id = int(agent["id"])
             agent_name = agent.get("name") or ""
         task = self.services.scheduler.create(
-            title, prompt, kind, schedule, timezone, agent_id=agent_id
+            title,
+            prompt,
+            kind,
+            schedule,
+            timezone,
+            agent_id=agent_id,
+            context=self._schedule_context(chat_id),
         )
         return {
             "task_id": task["id"],
@@ -353,11 +436,8 @@ class ToolKit:
     # -- browser ----------------------------------------------------------
     async def browser_open(self, args: Dict[str, Any], chat_id: str) -> Any:
         url = _require_text(args, "url", 2048)
-        allow_private = bool(self.services.prefs.get("browser_allow_private")) or bool(
-            self.services.settings.browser_allow_private_networks
-        )
         return await self.services.browser.open(
-            url, session=_browser_session(chat_id), allow_private=allow_private
+            url, session=_browser_session(chat_id)
         )
 
     async def browser_read(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -618,12 +698,36 @@ class ToolKit:
         name = str(raw or "").strip()
         if not name:
             raise ValueError("agent_id or agent name is required.")
-        return self.services.team.get_agent(name=name)
+        try:
+            return self.services.team.get_agent(name=name)
+        except TeamError:
+            lead = self.services.team.lead_profile()
+            aliases = {
+                lead["name"].lower(),
+                "muse",
+                "lead",
+                "team lead",
+                "the lead",
+                "owner",
+            }
+            if name.lower() in aliases:
+                return lead
+            raise
 
     async def list_team(self, args: Dict[str, Any], chat_id: str) -> Any:
         me = self._team_agent(chat_id)
+        lead = self.services.team.lead_profile()
         return {
             "me": me,
+            "lead": {
+                "id": lead["id"],
+                "name": lead["name"],
+                "role": lead["role"],
+                "note": (
+                    "The team lead is not a task assignee; send_message to the "
+                    "lead to report results or ask a question."
+                ),
+            },
             "agents": [
                 {
                     "id": agent["id"],
@@ -698,6 +802,11 @@ class ToolKit:
 
     async def assign_task(self, args: Dict[str, Any], chat_id: str) -> Any:
         agent = self._resolve_team_agent(args)
+        if int(agent.get("id") or 0) == 0:
+            raise ValueError(
+                "The team lead (%s) is not a task assignee; use send_message to "
+                "report to them instead." % agent.get("name")
+            )
         title = _require_text(args, "title", 120)
         prompt = _require_text(args, "prompt")
         me, current_task = parse_chat_context(chat_id)
@@ -736,9 +845,10 @@ class ToolKit:
             task_id = int(task_id) if task_id else None
         except (TypeError, ValueError):
             task_id = current_task
+        target = int(agent.get("id") or 0)
         message = self.services.team.send_message(
             from_agent_id=me,
-            to_agent_id=int(agent["id"]),
+            to_agent_id=target or None,  # 0 = the team lead -> Muse inbox
             content=content,
             task_id=task_id,
             kind="message",
@@ -746,7 +856,7 @@ class ToolKit:
         )
         return {
             "message_id": message["id"],
-            "to": message["to_name"],
+            "to": message["to_name"] or agent.get("name"),
             "task_id": message["task_id"],
         }
 
@@ -822,7 +932,41 @@ class ToolKit:
         specs.update(self._team_specs())
         specs.update(self._browser_specs())
         specs.update(self._shell_specs())
+        specs.update(self._utility_specs())
         return specs
+
+    def _utility_specs(self) -> Dict[str, ToolSpec]:
+        return {
+            "convert_time": ToolSpec(
+                name="convert_time",
+                description=(
+                    "Convert a timestamp to ET and JST (plus UTC/epoch). Use this "
+                    "before quoting any time, and always report both ET and JST."
+                ),
+                parameters=_obj(
+                    {
+                        "timestamp": _str("ISO timestamp or epoch seconds."),
+                        "from_timezone": _str(
+                            "IANA zone to assume when the timestamp has no offset."
+                        ),
+                    },
+                    ["timestamp"],
+                ),
+                handler=self.convert_time,
+            ),
+            "file_info": ToolSpec(
+                name="file_info",
+                description=(
+                    "Stat a file inside the shell workspace: size, mtime in UTC, "
+                    "human age, and a stale-file warning. Check this before "
+                    "trusting a data file."
+                ),
+                parameters=_obj(
+                    {"path": _str("Path inside the workspace.")}, ["path"]
+                ),
+                handler=self.file_info,
+            ),
+        }
 
     def _team_specs(self) -> Dict[str, ToolSpec]:
         return {
@@ -1419,6 +1563,46 @@ def summarise(tool: str, args: Dict[str, Any]) -> str:
             str(args.get("domain") or "the requested site")[:160]
         )
     return "%s %s" % (tool, json.dumps(_redact(args), ensure_ascii=False)[:200])
+
+
+def _human_age(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    for unit, size in (
+        ("year", 365 * 86400),
+        ("month", 30 * 86400),
+        ("day", 86400),
+        ("hour", 3600),
+        ("minute", 60),
+    ):
+        if seconds >= size:
+            value = int(seconds // size)
+            return "%d %s%s ago" % (value, unit, "" if value == 1 else "s")
+    return "%d seconds ago" % int(seconds)
+
+
+def _parse_moment(raw: str, tz_name: str) -> datetime:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("timestamp is required (ISO string or epoch seconds).")
+    try:
+        return datetime.fromtimestamp(float(text), tz=timezone.utc)
+    except ValueError:
+        pass
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        moment = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(
+            "Could not parse %r. Use an ISO timestamp (2026-11-25T16:30:00) or "
+            "epoch seconds." % text
+        ) from exc
+    if moment.tzinfo is None:
+        try:
+            zone = ZoneInfo(tz_name or "UTC")
+        except Exception:
+            zone = timezone.utc
+        moment = moment.replace(tzinfo=zone)
+    return moment
 
 
 def _team_agent_for_chat(services: Services, chat_id: str) -> Optional[int]:

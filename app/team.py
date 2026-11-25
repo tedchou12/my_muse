@@ -113,11 +113,34 @@ class TeamStore:
         audit: AuditLog,
         settings: Settings,
         openai: Any = None,
+        prefs: Any = None,
     ) -> None:
         self.db = db
         self.audit = audit
         self.settings = settings
         self.openai = openai
+        self.prefs = prefs
+
+    # -- lead identity ----------------------------------------------------
+    def lead_name(self) -> str:
+        """The current display name of the team lead (renamed in Settings)."""
+        name = ""
+        if self.prefs is not None:
+            try:
+                name = str(self.prefs.get("agent_name") or "").strip()
+            except Exception:
+                name = ""
+        return name or "Muse"
+
+    def lead_profile(self) -> Dict[str, Any]:
+        return {
+            "id": MUSE_ID,
+            "name": self.lead_name(),
+            "role": "Team lead",
+            "status": "active",
+            "model": "",
+            "instructions": "",
+        }
 
     # -- agents -----------------------------------------------------------
     def _agent_select(self) -> str:
@@ -729,13 +752,21 @@ class TeamStore:
             (MUSE_ID,),
         ):
             pairs.append(row)
+        for row in self.db.query(
+            "SELECT ? AS agent_a, from_agent_id AS agent_b, MAX(id) AS last_id "
+            "FROM agent_messages WHERE from_agent_id IS NOT NULL "
+            "AND to_agent_id IS NULL AND kind != 'group' "
+            "GROUP BY from_agent_id",
+            (MUSE_ID,),
+        ):
+            pairs.append(row)
         pairs.sort(key=lambda item: int(item["last_id"]), reverse=True)
         groups: List[Dict[str, Any]] = []
         for row in pairs[: max(1, min(int(limit), 100))]:
             agent_a_id = int(row["agent_a"])
             agent_b_id = int(row["agent_b"])
             first = (
-                {"id": MUSE_ID, "name": "Muse", "status": "active"}
+                {"id": MUSE_ID, "name": self.lead_name(), "status": "active"}
                 if agent_a_id == MUSE_ID
                 else self.db.one(
                     "SELECT id, name, status FROM agents WHERE id = ?",
@@ -788,7 +819,7 @@ class TeamStore:
     def group_info(self, agent_a: int, agent_b: int) -> Dict[str, Any]:
         first, second, _ = self.group_key(agent_a, agent_b)
         a = (
-            {"id": MUSE_ID, "name": "Muse", "status": "active"}
+            {"id": MUSE_ID, "name": self.lead_name(), "status": "active"}
             if first == MUSE_ID
             else self.get_agent(first)
         )
@@ -810,11 +841,14 @@ class TeamStore:
         messages: List[Dict[str, Any]] = []
         if first == MUSE_ID:
             agent_rows = self.db.query(
-                "SELECT m.*, t.name AS to_name FROM agent_messages m "
+                "SELECT m.*, f.name AS from_name, t.name AS to_name "
+                "FROM agent_messages m "
+                "LEFT JOIN agents f ON f.id = m.from_agent_id "
                 "LEFT JOIN agents t ON t.id = m.to_agent_id "
-                "WHERE m.from_agent_id IS NULL AND m.to_agent_id = ? "
+                "WHERE ((m.from_agent_id IS NULL AND m.to_agent_id = ?) "
+                "OR (m.from_agent_id = ? AND m.to_agent_id IS NULL)) "
                 "AND m.kind != 'group' ORDER BY m.id",
-                (second,),
+                (second, second),
             )
             task_rows = self.db.query(
                 "SELECT id, title, result, error, status, created_at, finished_at "
@@ -848,7 +882,7 @@ class TeamStore:
                     "content": row["content"],
                     "from_agent_id": row["from_agent_id"],
                     "from_name": (
-                        "Muse"
+                        self.lead_name()
                         if row["from_agent_id"] is None
                         else row.get("from_name") or "Agent"
                     ),
@@ -867,7 +901,7 @@ class TeamStore:
                     "from_agent_id": second,
                     "from_name": second_agent["name"],
                     "to_agent_id": MUSE_ID,
-                    "to_name": "Muse",
+                    "to_name": self.lead_name(),
                     "kind": "task_result",
                     "task_id": row["id"],
                     "created_at": row["finished_at"] or row["created_at"],
@@ -891,7 +925,7 @@ class TeamStore:
         if not content:
             raise TeamError("Message cannot be empty.")
         first_agent = (
-            {"id": MUSE_ID, "name": "Muse"}
+            {"id": MUSE_ID, "name": self.lead_name()}
             if first == MUSE_ID
             else self.get_agent(first)
         )

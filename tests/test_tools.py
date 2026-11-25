@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 
 import pytest
 
+from app.shell import workspace_path
 from app.tools import execute_tool, summarise
 from conftest import CSRF, FakeMessage, install_fake_ai
 
@@ -182,6 +185,104 @@ async def test_shell_secret_field_selector(app):
     assert result["ok"] is True, result
     assert result["result"]["stdout"] == "[redacted]"
     assert "agent-user" not in json.dumps(result)
+
+
+async def test_convert_time_reports_et_and_jst(app):
+    services = app.state.services
+    result = await execute_tool(
+        services, "convert_time", {"timestamp": 1795471752}, chat_id="default"
+    )
+    assert result["ok"] is True
+    payload = result["result"]
+    assert payload["utc"].startswith("2026-")
+    assert "ET" in payload["et"] or "EST" in payload["et"] or "EDT" in payload["et"]
+    assert "JST" in payload["jst"]
+    assert "ET" in payload["note"] and "JST" in payload["note"]
+
+
+async def test_file_info_flags_stale_files(app):
+    services = app.state.services
+    base = workspace_path(services.settings)
+    target = base / "positions.db"
+    target.write_text("fresh", encoding="utf-8")
+    old = time.time() - 60 * 86400
+    os.utime(target, (old, old))
+    result = await execute_tool(
+        services, "file_info", {"path": "positions.db"}, chat_id="default"
+    )
+    assert result["ok"] is True
+    info = result["result"]
+    assert info["exists"] is True
+    assert info["age_human"].endswith("ago")
+    assert "stale_warning" in info
+
+    outside = await execute_tool(
+        services, "file_info", {"path": "/etc/passwd"}, chat_id="default"
+    )
+    assert "workspace" in outside.get("error", outside.get("result", {}).get("error", ""))
+
+
+async def test_schedule_task_carries_chat_context(app):
+    install_fake_ai(app, [FakeMessage(content="Tick done.")])
+    services = app.state.services
+    services.prefs.update({"auto_approve_writes": True})
+    services.agent._store(
+        "ctx-chat", "user", "The dashboard lives at http://10.0.0.5/phpLiteAdmin"
+    )
+    result = await execute_tool(
+        services,
+        "schedule_task",
+        {
+            "title": "Dashboard watch",
+            "prompt": "Check the dashboard and report changes.",
+            "kind": "once",
+            "schedule": "2030-01-01T00:00",
+        },
+        chat_id="ctx-chat",
+    )
+    assert result["ok"] is True, result
+    task = services.scheduler.get(result["result"]["task_id"])
+    assert "10.0.0.5" in task["context"]
+
+    reply = await services.scheduler.runner(task)
+    assert reply == "Tick done."
+    first_call = services.openai.chat_calls[0]
+    prompt_text = "\n".join(str(item.get("content")) for item in first_call)
+    assert "Context captured when this task was scheduled" in prompt_text
+    assert "10.0.0.5" in prompt_text
+
+
+async def test_team_lead_resolves_after_rename(app):
+    services = app.state.services
+    services.prefs.update({"agent_name": "Smire"})
+    agent = services.team.create_agent("Scout", "Runner", "Do it.")
+    listed = await execute_tool(services, "list_team", {}, chat_id="default")
+    assert listed["ok"] is True
+    assert listed["result"]["lead"]["name"] == "Smire"
+
+    sent = await execute_tool(
+        services,
+        "send_message",
+        {"agent": "Smire", "content": "Status: all clear."},
+        chat_id="agent:%d:dm" % agent["id"],
+    )
+    assert sent["ok"] is True, sent
+    inbox = services.team.inbox(None, limit=5)
+    assert any("all clear" in row["content"] for row in inbox)
+
+    groups = services.team.list_groups()
+    assert any(
+        group["agent_a_name"] == "Smire" or group["agent_b_name"] == "Smire"
+        for group in groups
+    )
+
+    denied = await execute_tool(
+        services,
+        "assign_task",
+        {"agent": "Smire", "title": "Nope", "prompt": "Nope"},
+        chat_id="agent:%d:dm" % agent["id"],
+    )
+    assert "not a task assignee" in denied["error"]
 
 
 async def test_unknown_tool(app):

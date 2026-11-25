@@ -95,7 +95,7 @@ def build_services(settings: Settings) -> Services:
         },
     )
     vault = Vault(db, audit)
-    browser = BrowserManager(settings, vault)
+    browser = BrowserManager(settings, vault, prefs)
     providers = ProviderStore(db, settings, audit)
     credentials = CredentialRequestQueue(db, audit)
     trust = TrustedHosts(db, audit)
@@ -123,7 +123,7 @@ def build_services(settings: Settings) -> Services:
         approvals=approvals,
         scheduler=scheduler,
     )
-    services.team = TeamStore(db, audit, settings, openai_service)
+    services.team = TeamStore(db, audit, settings, openai_service, prefs)
     services.team_runner = TeamRunner(services)
     services.cancellations = CancellationRegistry()
     services.chat_queue = ChatQueue()
@@ -159,6 +159,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "Carry this out now and report the result. Do not ask follow-up "
             "questions." % (task["title"], task["kind"], task["prompt"])
         )
+        context_block = str(task.get("context") or "").strip()
+        if context_block:
+            prompt += (
+                "\n\nContext captured when this task was scheduled (you cannot "
+                "assume access to the earlier conversation; rely on this):\n"
+                + context_block[:2500]
+            )
         actor = "task:%d" % task["id"]
         runner: Agent = agent
         raw_agent = task.get("agent_id")

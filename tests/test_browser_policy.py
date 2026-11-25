@@ -597,6 +597,48 @@ def test_read_includes_iframe_text(settings):
     assert "Confirm to continue" in data["text"]
 
 
+class FakePrefs:
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+
+def test_browser_private_access_follows_pref(settings):
+    settings.browser_allow_private_networks = False
+    blocked = BrowserManager(settings, None, FakePrefs({}))
+    with pytest.raises(Exception) as info:
+        asyncio.run(blocked._checked_url("http://10.0.0.5/"))
+    message = str(info.value)
+    assert "private" in message.lower() or "LAN" in message
+
+    allowed = BrowserManager(
+        settings, None, FakePrefs({"browser_allow_private": True})
+    )
+    assert (
+        asyncio.run(allowed._checked_url("http://10.0.0.5/"))
+        == "http://10.0.0.5/"
+    )
+
+
+def test_click_warns_when_page_did_not_change(settings):
+    page = FakePage(by_text={"Submit"})
+    page.body_text = "Login form"
+    manager = _manager_with_page(settings, page)
+    result = asyncio.run(manager.click("Submit"))
+    assert result.get("unchanged") is True
+    assert "silently" in result.get("warning", "")
+
+
+def test_type_submit_warns_when_page_did_not_change(settings):
+    page = FakePage(by_label={"User"})
+    page.body_text = "Login form"
+    manager = _manager_with_page(settings, page)
+    result = asyncio.run(manager.type_text("User", "me", submit=True))
+    assert result.get("unchanged") is True
+
+
 def test_private_networks_can_be_enabled_for_dev():
     assert (
         validate_url("http://127.0.0.1:8080/", allow_private=True, resolve=False)

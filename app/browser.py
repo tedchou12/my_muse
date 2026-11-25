@@ -17,6 +17,7 @@ untrusted.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import logging
 import re
@@ -384,9 +385,15 @@ def rewrite_view_host(url: str, host: Optional[str]) -> str:
 
 
 class BrowserManager:
-    def __init__(self, settings: Settings, vault: Vault) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        vault: Optional[Vault] = None,
+        prefs: Any = None,
+    ) -> None:
         self.settings = settings
         self.vault = vault
+        self.prefs = prefs
         self._lock: Optional[asyncio.Lock] = None
         self._playwright: Any = None
         self._context: Any = None
@@ -406,6 +413,17 @@ class BrowserManager:
         self._monitored_pages: set[int] = set()
         self._console_audit_seen: set[tuple[str, str]] = set()
         self._cors_audited: set[str] = set()
+        self.policy_blocks: List[Dict[str, Any]] = []
+
+    def _allow_private(self) -> bool:
+        """Private/LAN access is allowed by the live pref or the env default."""
+        override: Any = None
+        if self.prefs is not None:
+            try:
+                override = self.prefs.get("browser_allow_private")
+            except Exception:
+                override = None
+        return bool(override) or bool(self.settings.browser_allow_private_networks)
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -471,6 +489,8 @@ class BrowserManager:
             "session": session,
             "console": list(self.console_events[-120:]),
             "failed_requests": list(self.failed_requests[-120:]),
+            "policy_blocks": list(self.policy_blocks[-30:]),
+            "allow_private_networks": self._allow_private(),
             "cors_mode": self.settings.browser_cors_mode,
             "cors_domains": self.settings.cors_domains,
             "cors_injections": self.cors_injections,
@@ -740,10 +760,18 @@ class BrowserManager:
             validate_url(
                 url,
                 self.settings.allowed_domains,
-                self.settings.browser_allow_private_networks,
+                self._allow_private(),
                 resolve=False,
             )
-        except ValueError:
+        except ValueError as exc:
+            self.policy_blocks.append(
+                {
+                    "url": url[:300],
+                    "reason": str(exc)[:200],
+                    "ts": time.time(),
+                }
+            )
+            self.policy_blocks[:] = self.policy_blocks[-50:]
             await route.abort()
             return
         if await self._inject_cors(route, request):
@@ -868,17 +896,38 @@ class BrowserManager:
         self, url: str, allow_private: Optional[bool] = None
     ) -> str:
         if allow_private is None:
-            allow_private = bool(self.settings.browser_allow_private_networks)
+            allow_private = self._allow_private()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: validate_url(
-                url,
-                self.settings.allowed_domains,
-                bool(allow_private),
-                True,
-            ),
-        )
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: validate_url(
+                    url,
+                    self.settings.allowed_domains,
+                    bool(allow_private),
+                    True,
+                ),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            lowered = message.lower()
+            if not allow_private and any(
+                marker in lowered
+                for marker in (
+                    "private",
+                    "non-public",
+                    "localhost",
+                    "link-local",
+                    "reserved",
+                )
+            ):
+                raise BrowserError(
+                    "%s Enable Settings → “Let the browser open LAN / private-"
+                    "network addresses” (browser_allow_private) to use internal "
+                    "hosts such as 192.168.x.x, or use run_shell curl for this "
+                    "host." % message
+                ) from exc
+            raise
 
     async def _page_text(self, page: Any, limit: int = 3000) -> str:
         try:
@@ -1094,12 +1143,28 @@ class BrowserManager:
                     fallback = (frame, first)
         return fallback if fallback else (None, None)
 
+    async def _page_signature(self, page: Any) -> Tuple[str, str]:
+        """A cheap fingerprint so silent no-op actions can be detected."""
+        try:
+            text = await page.inner_text("body")
+        except Exception:
+            text = ""
+        digest = hashlib.sha1(
+            _collapse(text, 4000).encode("utf-8", "replace")
+        ).hexdigest()
+        try:
+            url = str(page.url)
+        except Exception:
+            url = ""
+        return url, digest
+
     async def click(
         self, target: str, session: str = "default", kind: str = "auto"
     ) -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
+            before = await self._page_signature(page)
             frame, locator = await self._resolve_target(page, target, kind)
             if locator is None:
                 frame_count = len(await self._frame_list(page))
@@ -1177,11 +1242,21 @@ class BrowserManager:
                 pass
             await asyncio.sleep(0.4)
             self._remember(session, page)
-            return {
+            result: Dict[str, Any] = {
                 "url": page.url,
                 "title": await page.title(),
                 "text": await self._page_text(page, 1500),
             }
+            after = await self._page_signature(page)
+            if after == before:
+                result["unchanged"] = True
+                result["warning"] = (
+                    "The page did not change after this action, so it may have "
+                    "silently failed (for example a stale CSRF token re-rendered "
+                    "the same form). Re-read the page for an error message, or "
+                    "reload and retry."
+                )
+            return result
 
     async def type_text(
         self,
@@ -1194,6 +1269,7 @@ class BrowserManager:
         session = (session or "default").strip()[:100] or "default"
         async with self.lock:
             page = await self._ensure_page(session)
+            before = await self._page_signature(page)
             frame, locator = await self._resolve_target(page, selector, kind)
             if locator is None:
                 raise BrowserError(
@@ -1218,11 +1294,22 @@ class BrowserManager:
                     "Could not type into %r: %s" % (selector, exc)
                 ) from exc
             self._remember(session, page)
-            return {
+            result: Dict[str, Any] = {
                 "url": page.url,
                 "title": await page.title(),
                 "text": await self._page_text(page, 1500),
             }
+            if submit:
+                after = await self._page_signature(page)
+                if after == before:
+                    result["unchanged"] = True
+                    result["warning"] = (
+                        "Submitting did not change the page, so the form may have "
+                        "silently rejected the input (for example an expired CSRF "
+                        "token). Re-read the page for validation errors and retry "
+                        "with a fresh form."
+                    )
+            return result
 
     async def press(self, key: str, session: str = "default") -> Dict[str, Any]:
         session = (session or "default").strip()[:100] or "default"

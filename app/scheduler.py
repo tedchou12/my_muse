@@ -134,6 +134,7 @@ class Scheduler:
         schedule: str,
         timezone: Optional[str] = None,
         agent_id: Optional[int] = None,
+        context: str = "",
     ) -> Dict[str, Any]:
         title = (title or "").strip()
         prompt = (prompt or "").strip()
@@ -142,10 +143,12 @@ class Scheduler:
         if not prompt:
             raise ScheduleError("Prompt is required.")
         tz_name = (timezone or self.timezone or "UTC").strip()
+        context = str(context or "").strip()[:6000]
         next_run = compute_next_run(kind, schedule, tz_name)
         task_id = self.db.insert(
             "INSERT INTO tasks (title, prompt, kind, schedule, timezone, active, "
-            "next_run_at, created_at, agent_id) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            "next_run_at, created_at, agent_id, context) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
             (
                 title,
                 prompt,
@@ -155,6 +158,7 @@ class Scheduler:
                 next_run,
                 now_ts(),
                 int(agent_id) if agent_id else None,
+                context,
             ),
         )
         self.audit.log(
