@@ -189,7 +189,35 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         return str(result.get("reply") or "").strip() or "No reply."
 
+    async def deliver_scheduled_result(
+        task: Dict[str, Any], status: str, result: str
+    ) -> None:
+        """Post a finished run into a chat the user can actually see.
+
+        Runs execute in their own ``task:<id>`` transcript, so without this the
+        outcome only lives in ``tasks.last_result`` and never reaches the user.
+        Muse tasks report in the main chat; agent tasks report in that agent's
+        DM so the message comes from the bot that did the work.
+        """
+        raw_agent = task.get("agent_id")
+        chat_id = "agent:%d:dm" % int(raw_agent) if raw_agent else "default"
+        header = "Scheduled task #%s · %s (%s)" % (
+            task["id"],
+            task["title"],
+            task["kind"],
+        )
+        if status != "ok":
+            header += " — FAILED (%s)" % status
+        body = str(result or "").strip() or "No reply."
+        services.agent.attach(chat_id, "%s\n\n%s" % (header, body[:4000]))
+        services.audit.log(
+            "system",
+            "task_delivered",
+            {"id": task["id"], "chat_id": chat_id, "status": status},
+        )
+
     services.scheduler.runner = run_scheduled_task
+    services.scheduler.notifier = deliver_scheduled_result
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

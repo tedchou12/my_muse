@@ -142,6 +142,49 @@ async def test_runner_failure_is_recorded(scheduler):
     assert scheduler.get(task["id"])["last_status"] == "error"
 
 
+async def test_notifier_receives_finished_runs(scheduler):
+    seen = []
+
+    async def runner(task):
+        return "finished: %s" % task["title"]
+
+    async def notifier(task, status, result):
+        seen.append((task["id"], status, result))
+
+    scheduler.runner = runner
+    scheduler.notifier = notifier
+    task = scheduler.create("Ping", "Say hi", "once", "2026-01-01T00:00")
+    scheduler.db.execute(
+        "UPDATE tasks SET next_run_at = ? WHERE id = ?", (time.time() - 1, task["id"])
+    )
+    await scheduler.poll_once()
+    await asyncio.sleep(0.2)
+
+    assert seen == [(task["id"], "ok", "finished: Ping")]
+
+
+async def test_notifier_reports_failures(scheduler):
+    seen = []
+
+    async def runner(task):
+        raise RuntimeError("boom")
+
+    async def notifier(task, status, result):
+        seen.append((status, result))
+
+    scheduler.runner = runner
+    scheduler.notifier = notifier
+    task = scheduler.create("Ping", "Say hi", "once", "2026-01-01T00:00")
+    scheduler.db.execute(
+        "UPDATE tasks SET next_run_at = ? WHERE id = ?", (time.time() - 1, task["id"])
+    )
+    await scheduler.poll_once()
+    await asyncio.sleep(0.2)
+
+    assert seen and seen[0][0] == "error"
+    assert "boom" in seen[0][1]
+
+
 def test_recover_moves_missed_cron_forward(scheduler):
     task = scheduler.create("Daily", "Report", "cron", "0 8 * * *")
     scheduler.db.execute(

@@ -28,6 +28,8 @@ const state = {
   teamTimer: null,
   groupTimer: null,
   badgeTimer: null,
+  chatUpdatesTimer: null,
+  chatLastId: null,
   chatTimer: null,
   provider: null,
   providerPreset: null,
@@ -326,6 +328,7 @@ async function api(path, options = {}) {
     if (res.status === 401 && !path.includes("/api/login")) {
       stopBrowserPolling();
       stopVaultPolling();
+      stopChatUpdatesPolling();
       if (state.badgeTimer) {
         clearInterval(state.badgeTimer);
         state.badgeTimer = null;
@@ -343,6 +346,7 @@ async function api(path, options = {}) {
 /* ---------------------------------------------------------------- auth */
 function showLogin() {
   stopChatPolling();
+  stopChatUpdatesPolling();
   $("#shell").classList.add("hidden");
   $("#login").classList.remove("hidden");
   $("#login-password").value = "";
@@ -367,6 +371,7 @@ function enterApp(session) {
   switchTab("chat");
   renderAgentNav();
   refreshBadges();
+  startChatUpdatesPolling();
   if (!state.badgeTimer) {
     state.badgeTimer = setInterval(refreshBadges, 20000);
   }
@@ -635,7 +640,11 @@ async function loadChat() {
       ),
       api("/api/approvals"),
     ]);
-    renderChat(data.messages || []);
+    const chatMessages = data.messages || [];
+    state.chatLastId = chatMessages.length
+      ? chatMessages[chatMessages.length - 1].id
+      : null;
+    renderChat(chatMessages);
     (creds.requests || []).forEach(appendCredentialCard);
     (approvals.pending || [])
       .filter((item) => item.chat_id === state.chatId)
@@ -770,6 +779,46 @@ async function syncChatRunState() {
   }
 }
 
+function stopChatUpdatesPolling() {
+  if (state.chatUpdatesTimer) {
+    clearInterval(state.chatUpdatesTimer);
+    state.chatUpdatesTimer = null;
+  }
+}
+
+function startChatUpdatesPolling() {
+  if (state.chatUpdatesTimer) return;
+  // Background runs (scheduled tasks, team runners) append messages without a
+  // local run, so poll the open chat for new rows even when nothing is active.
+  state.chatUpdatesTimer = setInterval(async () => {
+    if (!state.session || state.chatGroup) return;
+    if (state.runs[state.chatId]) return; // the run poller already refreshes
+    try {
+      const data = await api(
+        "/api/chat/history?chat_id=" +
+          encodeURIComponent(state.chatId) +
+          "&limit=1"
+      );
+      const messages = data.messages || [];
+      const newest = messages.length ? messages[messages.length - 1] : null;
+      if (!newest || newest.id === state.chatLastId) return;
+      state.chatLastId = newest.id;
+      if (state.tab === "chat") {
+        await loadChat();
+        return;
+      }
+      const agent = currentChatAgent();
+      const name = agent
+        ? agent.name
+        : (state.session && state.session.agent_name) || "Muse";
+      toast("New message from " + name + ".");
+      await refreshBadges();
+    } catch (error) {
+      /* transient network errors must not stop the poller */
+    }
+  }, 8000);
+}
+
 function startChatPolling() {
   if (state.chatTimer) return;
   state.chatTimer = setInterval(async () => {
@@ -864,6 +913,7 @@ function setGroupTarget(group) {
 
 function setChatTarget(agent, load = true) {
   state.chatGroup = null;
+  state.chatLastId = null;
   stopGroupPolling();
   if (agent) {
     state.chatAgentId = Number(agent.id);
@@ -3715,6 +3765,7 @@ function bindEvents() {
       clearInterval(state.badgeTimer);
       state.badgeTimer = null;
     }
+    stopChatUpdatesPolling();
     stopBrowserPolling();
     stopVaultPolling();
     state.session = null;

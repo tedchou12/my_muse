@@ -969,6 +969,12 @@ Deliberately out of scope for v0.1:
 - **Scheduled tasks carry their context.** When you schedule a task, the last
   few chat turns are stored with it and injected into the prompt when it fires,
   so an automation does not depend on chat memory it cannot see.
+- **Scheduled results are delivered.** Each run still executes in its own
+  `task:<id>` transcript, but the outcome is also posted as a message in a chat
+  you can see: Muse tasks report in the main chat, tasks assigned to an agent
+  report in that agent's DM (with a "Scheduled task #N · title" header, or a
+  FAILED marker plus the error). The chat polls for new messages every few
+  seconds, so a background run appears without a reload.
 - **Time and data hygiene.** `convert_time` converts any timestamp to ET and JST
   (the system prompt requires reporting both); `file_info` reports a file's
   mtime, age and a stale-file warning so an old local copy is never mistaken

@@ -103,6 +103,9 @@ class Scheduler:
         self.max_concurrent = max(1, int(max_concurrent))
         self.enabled = enabled
         self.runner: Optional[Callable[[Dict[str, Any]], Awaitable[str]]] = None
+        self.notifier: Optional[
+            Callable[[Dict[str, Any], str, str], Awaitable[None]]
+        ] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
@@ -393,4 +396,14 @@ class Scheduler:
                     "task_run",
                     {"title": task["title"], "status": status},
                     status,
+                )
+        if self.notifier is not None and status != "cancelled":
+            try:
+                await self.notifier(task, status, result)
+            except Exception as exc:  # delivery must never kill the scheduler
+                self.audit.log(
+                    "system",
+                    "task_notify_error",
+                    {"id": task["id"], "error": "%s: %s" % (type(exc).__name__, exc)},
+                    "error",
                 )
