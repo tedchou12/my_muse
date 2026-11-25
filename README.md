@@ -974,7 +974,9 @@ Deliberately out of scope for v0.1:
   you can see: Muse tasks report in the main chat, tasks assigned to an agent
   report in that agent's DM (with a "Scheduled task #N · title" header, or a
   FAILED marker plus the error). The chat polls for new messages every few
-  seconds, so a background run appears without a reload.
+  seconds, so a background run appears without a reload. Agent-assigned runs use
+  `agent:<id>:task:<id>` as their chat id, so messages they send keep the
+  agent's identity in the inbox and their private memory/skills apply.
 - **Time and data hygiene.** `convert_time` converts any timestamp to ET and JST
   (the system prompt requires reporting both); `file_info` reports a file's
   mtime, age and a stale-file warning so an old local copy is never mistaken

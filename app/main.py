@@ -171,6 +171,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 + context_block[:2500]
             )
         actor = "task:%d" % task["id"]
+        chat_id = "task:%d" % task["id"]
         runner: Agent = agent
         raw_agent = task.get("agent_id")
         if raw_agent:
@@ -178,12 +179,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 profile = services.team.get_agent(int(raw_agent))
                 if profile["status"] == "active":
                     runner = Agent(services, profile=profile)
+                    # Encode the agent in the chat id: tools derive the sender,
+                    # the private memory/skill scope and the browser window from
+                    # it, so a plain "task:<id>" would make the agent look like
+                    # the user.
+                    chat_id = "agent:%d:task:%d" % (
+                        int(raw_agent),
+                        int(task["id"]),
+                    )
             except Exception:
                 logger.exception(
                     "Scheduled task %s: assigned agent unavailable", task["id"]
                 )
         result = await runner.run(
-            chat_id="task:%d" % task["id"],
+            chat_id=chat_id,
             user_text=prompt,
             actor=actor,
         )
