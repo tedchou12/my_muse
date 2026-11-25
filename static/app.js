@@ -31,6 +31,10 @@ const state = {
   chatUpdatesTimer: null,
   seenChats: {},
   unreadChats: {},
+  renderedChatId: null,
+  renderedChat: {},
+  echoes: {},
+  teamSignature: null,
   chatTimer: null,
   provider: null,
   providerPreset: null,
@@ -502,10 +506,21 @@ function renderAgentNav() {
   const groupBlock = groupRows
     ? '<div class="agent-empty group-label">Group chats</div>' + groupRows
     : "";
-  list.innerHTML =
+  const html =
     lead +
     (rows || '<div class="agent-empty">No bots yet. Use “＋ New bot” to create one.</div>') +
     groupBlock;
+  const nav = $("#agent-nav");
+  const previousTop = nav ? nav.scrollTop : 0;
+  const previousLeft = nav ? nav.scrollLeft : 0;
+  if (list.dataset.signature !== html) {
+    list.dataset.signature = html;
+    list.innerHTML = html;
+  }
+  if (nav) {
+    nav.scrollTop = previousTop;
+    nav.scrollLeft = previousLeft;
+  }
 }
 
 async function onAgentChat(event) {
@@ -651,6 +666,7 @@ async function loadChat() {
       : null;
     if (newest) state.seenChats[state.chatId] = newest;
     delete state.unreadChats[state.chatId];
+    state.echoes[state.chatId] = [];
     renderChat(chatMessages);
     (creds.requests || []).forEach(appendCredentialCard);
     (approvals.pending || [])
@@ -811,7 +827,6 @@ function chatName(chatId) {
 
 async function refreshChatUpdates() {
   if (!state.session || state.chatGroup) return;
-  if (state.runs[state.chatId]) return; // the run poller already refreshes
   try {
     const data = await api("/api/chat/latest");
     let changed = false;
@@ -825,8 +840,8 @@ async function refreshChatUpdates() {
       if (Number(row.id) <= Number(seen)) return;
       state.seenChats[chatId] = row.id;
       changed = true;
-      if (chatId === state.chatId) {
-        if (state.tab === "chat") loadChat();
+      if (chatId === state.chatId && state.tab === "chat") {
+        syncChatMessages();
         return;
       }
       state.unreadChats[chatId] = true;
@@ -883,7 +898,7 @@ function startChatPolling() {
       appendWorkingIndicator();
       updateChatRunUI();
       renderAgentNav();
-      await loadChat();
+      await syncChatMessages();
     } catch (error) {
       /* keep the timer alive; a temporary network error should not kill it */
     }
@@ -959,9 +974,26 @@ function setChatTarget(agent, load = true) {
 }
 
 
+function chatRenderKey() {
+  if (state.chatGroup) {
+    return (
+      "group:" + state.chatGroup.agent_a_id + ":" + state.chatGroup.agent_b_id
+    );
+  }
+  return state.chatId;
+}
+
 function renderChat(messages) {
   const box = $("#messages");
+  const key = chatRenderKey();
+  const switching = state.renderedChatId !== key;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const previousTop = box.scrollTop;
   box.innerHTML = "";
+  state.renderedChatId = key;
+  state.renderedChat[key] = messages.length
+    ? Number(messages[messages.length - 1].id) || 0
+    : 0;
   if (!messages.length) {
     if (state.chatGroup) {
       box.innerHTML =
@@ -980,7 +1012,58 @@ function renderChat(messages) {
     return;
   }
   messages.forEach(appendMessage);
-  box.scrollTop = box.scrollHeight;
+  // Re-renders happen every few seconds while a run is active or a background
+  // task reports in; only jump to the bottom when the user is already there.
+  if (switching || atBottom) {
+    box.scrollTop = box.scrollHeight;
+  } else {
+    box.scrollTop = previousTop;
+  }
+}
+
+async function syncChatMessages() {
+  if (state.chatGroup) return;
+  const chatId = state.chatId;
+  const data = await api(
+    "/api/chat/history?chat_id=" + encodeURIComponent(chatId) + "&limit=100"
+  );
+  if (chatId !== state.chatId) return; // the user switched chats mid-fetch
+  const messages = data.messages || [];
+  const rendered = Number(state.renderedChat[chatId] || 0);
+  const fresh = messages.filter((item) => Number(item.id) > rendered);
+  if (!fresh.length) return;
+  const box = $("#messages");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const typing = box.querySelector(".typing");
+  if (typing) typing.remove();
+  // A message the user just sent is already on screen; skip its persisted row
+  // so the incremental sync does not duplicate the bubble.
+  const echoes = state.echoes[chatId] || [];
+  fresh.forEach((item) => {
+    if (item.role === "user" && echoes.length) {
+      const index = echoes.findIndex((echo) =>
+        echo.text ? String(item.content || "").startsWith(echo.text) : true
+      );
+      if (index >= 0) {
+        echoes.splice(index, 1);
+        return;
+      }
+    }
+    appendMessage(item);
+  });
+  state.echoes[chatId] = echoes;
+  if (typing) box.appendChild(typing);
+  const newest = Number(fresh[fresh.length - 1].id);
+  state.renderedChat[chatId] = newest;
+  state.seenChats[chatId] = newest;
+  delete state.unreadChats[chatId];
+  renderAgentNav();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function queueChatEcho(chatId, text) {
+  if (!state.echoes[chatId]) state.echoes[chatId] = [];
+  state.echoes[chatId].push({ text: String(text || "") });
 }
 
 function appendMessage(message) {
@@ -1306,6 +1389,7 @@ async function sendMessage(event) {
       attachments: attachments,
       created_at: Date.now() / 1000,
     });
+    queueChatEcho(activeChatId, text);
     try {
       const result = await api("/api/chat", {
         method: "POST",
@@ -1345,6 +1429,7 @@ async function sendMessage(event) {
     attachments: attachments,
     created_at: Date.now() / 1000,
   });
+  queueChatEcho(runChatId, text);
   appendWorkingIndicator();
   updateChatRunUI();
   renderAgentNav();
@@ -1604,6 +1689,42 @@ async function onTaskAction(event) {
 }
 
 /* --------------------------------------------------------------- team */
+function teamSignature(data) {
+  const agents = (data.agents || []).map((agent) =>
+    [
+      agent.id,
+      agent.name,
+      agent.role,
+      agent.status,
+      agent.model,
+      agent.trusted_commands,
+      agent.memory_count,
+      agent.skill_count,
+      agent.open_tasks,
+      agent.done_tasks,
+    ].join("|")
+  );
+  const tasks = (data.tasks || []).map((task) =>
+    [task.id, task.status, task.run_count, task.agent_id].join("|")
+  );
+  const messages = (data.messages || []).map((item) => item.id);
+  const lead = data.lead
+    ? [data.lead.name, data.lead.memory_count, data.lead.skill_count]
+    : [];
+  return JSON.stringify([agents, tasks, messages, lead]);
+}
+
+function reopenScopePanels(owners) {
+  owners.forEach((owner) => {
+    const panel = document.querySelector(
+      'details.scope-panel[data-owner="' + owner + '"]'
+    );
+    if (!panel) return;
+    panel.open = true;
+    if (panel.dataset.loaded !== "1") loadScopePanel(panel);
+  });
+}
+
 async function loadTeam() {
   try {
     const data = await api("/api/team");
@@ -1611,9 +1732,26 @@ async function loadTeam() {
     state.agents = data.agents || [];
     renderAgentNav();
     loadGroups();
+    const signature = teamSignature(data);
+    const unchanged = signature === state.teamSignature;
+    state.teamSignature = signature;
+    if (unchanged && state.tab === "team") {
+      // The 5s poller must not rebuild the tab under the user: keep scroll,
+      // open panels and text selection intact when nothing changed.
+      if (state.teamTaskId) await loadTeamThread(state.teamTaskId);
+      return;
+    }
+    const openScopes = $$(
+      "#bot-list details.scope-panel, #lead-card details.scope-panel"
+    )
+      .filter((panel) => panel.open)
+      .map((panel) => panel.dataset.owner);
+    const scrollY = window.scrollY;
     renderTeamLead(data.lead || null);
     renderTeamAgents(data.agents || []);
     renderTeamTasks(data.tasks || []);
+    reopenScopePanels(openScopes);
+    window.scrollTo(0, scrollY);
     if (state.teamTaskId) {
       await loadTeamThread(state.teamTaskId);
     }
