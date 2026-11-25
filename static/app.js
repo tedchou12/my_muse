@@ -1750,12 +1750,17 @@ async function loadTeam() {
     )
       .filter((panel) => panel.open)
       .map((panel) => panel.dataset.owner);
-    const scrollY = window.scrollY;
+    const tabEl = $("#tab-team");
+    const scrollTop = tabEl ? tabEl.scrollTop : window.scrollY;
     renderTeamLead(data.lead || null);
     renderTeamAgents(data.agents || []);
     renderTeamTasks(data.tasks || []);
     reopenScopePanels(openScopes);
-    window.scrollTo(0, scrollY);
+    if (tabEl) {
+      tabEl.scrollTop = scrollTop;
+    } else {
+      window.scrollTo(0, scrollTop);
+    }
     if (state.teamTaskId) {
       await loadTeamThread(state.teamTaskId);
     }
