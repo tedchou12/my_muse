@@ -485,6 +485,36 @@ button.link:hover { color: var(--text); }
 .item.pending { border-color: rgba(245,181,68,.35); background: linear-gradient(180deg, rgba(245,181,68,.06), transparent), var(--panel); }
 .item.error { border-color: rgba(255,107,129,.3); }
 
+/* per-owner memory & skills panel (Team tab) */
+details.scope-panel {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+}
+details.scope-panel summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.scope-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.scope-title {
+  margin: 2px 0 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+}
+.scope-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.scope-row .grow { flex: 1; min-width: 0; }
+.scope-row .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.scope-add { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 4px; }
+pre.skill-text { max-height: 180px; }
+
 pre.detail {
   margin: 8px 0 0;
   padding: 10px;

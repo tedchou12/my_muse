@@ -10,9 +10,11 @@ from .browser import BrowserManager
 from .config import Settings
 from .credentials import CredentialRequestQueue
 from .db import Database
+from .memory import MemoryStore
 from .openai_client import OpenAIService
 from .providers import ProviderStore
 from .scheduler import Scheduler
+from .skills import SkillStore
 from .trust import TrustedHosts
 from .vault import Vault
 
@@ -31,6 +33,8 @@ class Services:
     openai: OpenAIService
     approvals: ApprovalQueue
     scheduler: Scheduler
+    memories: MemoryStore
+    skills: SkillStore
     team: Any = None
     team_runner: Any = None
     cancellations: Any = None

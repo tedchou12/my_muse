@@ -65,7 +65,8 @@ Grok Bot:
 | Scheduling | Durable once / interval / cron jobs with run history |
 | Text, images & files | OpenAI text model + image model; image/document uploads in chat; generated files stored as artifacts |
 | Credential safety | Argon2id + AES-256-GCM vault with domain-bound autofill and TOTP support that never exposes secrets to the model |
-| Memory | `remember` / `recall` facts injected into the system prompt |
+| Memory | Private per owner: the lead and each agent keep separate `remember` / `recall` facts injected into their own prompt |
+| Skills | Private per owner: `skill_save` / `skill_list` / `skill_use` / `skill_delete` store procedures; only names + summaries reach the prompt |
 | Persona | Editable name, style and timezone |
 | Hosting | One `docker compose up`, persistent named volume |
 
@@ -74,6 +75,7 @@ Grok Bot:
 - [x] Chat with an agent that can chain tool calls
 - [x] Create named agents from a prompt; each has a role and standing instructions
 - [x] Direct chat with any named bot from the Team tab
+- [x] Private per-agent memory and skills, editable in Settings → Team (lead read-only inspection)
 - [x] Agent-to-agent group chats plus Muse ↔ agent groups, with you as a participant
 - [x] Multiple agent chats running concurrently, each with its own Stop and working state
 - [x] Send more messages while an agent is working; they queue into the current context
@@ -901,6 +903,10 @@ make test
   embedded credentials, allowlists and subdomains.
 - **Tools**: read vs write gate, `vault_fill` always-approval, memory tools,
   redaction.
+- **Private memory & skills**: per-owner scope helpers, schema migration that
+  backfills legacy facts by chat id, isolation between agents, lead read-only
+  inspection, prompt injection of own scope only (skills as summaries), and the
+  Team-tab memory/skill API.
 - **API**: auth, CSRF, task CRUD, vault flow, chat tool loop, optional step cap
   and unlimited mode, repetition guard, pending-approval stop, image approval,
   rejection, settings, disabled browser.
@@ -948,6 +954,18 @@ Deliberately out of scope for v0.1:
   simple bot onto a free model, or an empty model to restore the provider
   default); named agents cannot change models, and the change is approval-gated
   and audited.
+- **Memory and skills are private per owner.** The team lead and every named
+  agent have their own memory (`remember` / `recall`) and their own skills
+  (`skill_save` / `skill_list` / `skill_use` / `skill_delete`). Nothing is shared
+  between agents, which keeps each prompt small and prevents cross-talk. Only the
+  skill names and one-line summaries are injected into a prompt; full
+  instructions load on demand with `skill_use`. The team lead can *read* another
+  agent's memory/skills for debugging (`recall`/`skill_list`/`skill_use` with
+  `agent=`), but cannot write into them. Scheduled tasks run under the assigned
+  agent's scope, so its notes and skills follow it into its automations.
+  Everything is visible and editable (including memory deletion) in
+  Settings → Team, where each bot card and the team-lead card show a
+  Memory & skills panel.
 - **Scheduled tasks carry their context.** When you schedule a task, the last
   few chat turns are stored with it and injected into the prompt when it fires,
   so an automation does not depend on chat memory it cannot see.

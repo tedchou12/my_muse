@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from .openai_client import OpenAIConfigError
+from .scope import scope_from_profile
 from .services import Services
 from .tools import execute_tool
 from .uploads import user_content
@@ -36,10 +37,6 @@ class Agent:
         except Exception:
             tz_name = "UTC"
             now = datetime.now(ZoneInfo("UTC"))
-        rows = self.services.db.query(
-            "SELECT content FROM memories ORDER BY id DESC LIMIT 12"
-        )
-        facts = "\n".join("- " + row["content"] for row in rows) or "- (nothing yet)"
         write_state = "enabled" if prefs.get("write_enabled") else "DISABLED"
         auto_state = "on" if prefs.get("auto_approve_writes") else "off"
         browser_auto_state = (
@@ -49,6 +46,14 @@ class Agent:
         profile = self.profile
         name = profile.get("name") or prefs.get("agent_name") or "Muse"
         style = prefs.get("agent_style") or "concise and helpful"
+        scope = scope_from_profile(profile)
+        rows = self.services.memories.recent(scope, 12)
+        facts = "\n".join("- " + row["content"] for row in rows) or "- (nothing yet)"
+        skills = self.services.skills.list(scope, 20)
+        skill_lines = (
+            "\n".join("- %s: %s" % (row["name"], row["summary"]) for row in skills)
+            or "- (none yet)"
+        )
 
         if profile:
             identity = (
@@ -99,7 +104,10 @@ class Agent:
             "when that setting is on. Do not ask the user to confirm every small "
             "browser step; proceed and report the result. Still ask before "
             "purchases, sending messages, or irreversible actions.\n"
-            "- Use remember/recall for durable preferences. Never store secrets.\n"
+            "- Use remember/recall for durable preferences: your memory is "
+            "private to you, and other agents never see it. Use skill_save for "
+            "reusable procedures and skill_use to load one when you need it. "
+            "Never store secrets.\n"
             "- Timestamps: never parrot a raw time. Call convert_time (or convert "
             "it yourself) and always state both ET (America/New_York) and JST "
             "(Asia/Tokyo), e.g. '06:30 JST = 16:30 ET the previous day'.\n"
@@ -161,7 +169,6 @@ class Agent:
             "Style: %s. Keep replies short, plain text, and skimmable. When a "
             "scheduled task fires, execute it and summarise the outcome without "
             "asking follow-up questions.\n\n"
-            "Known facts about the user:\n%s\n"
             % (
                 now.strftime("%A, %d %B %Y, %H:%M"),
                 tz_name,
@@ -170,10 +177,27 @@ class Agent:
                 browser_auto_state,
                 shell_state,
                 style,
-                facts,
             )
         )
-        return identity + "\n\n" + details + team_block
+        if profile:
+            memory_block = (
+                "\nYour private memory (visible only to you; every other agent "
+                "keeps its own):\n%s\n\n"
+                "Your private skills (call skill_use with the name to load the "
+                "full instructions before following one):\n%s\n"
+                % (facts, skill_lines)
+            )
+        else:
+            memory_block = (
+                "\nKnown facts about the user (the team lead's private memory):\n"
+                "%s\n\n"
+                "Your private skills (call skill_use with the name to load the "
+                "full instructions before following one). Team lead only: "
+                "recall/skill_list/skill_use accept agent=<id or name> to read "
+                "another agent's notes in read-only mode:\n%s\n"
+                % (facts, skill_lines)
+            )
+        return identity + "\n\n" + details + memory_block + team_block
 
     # -- persistence ------------------------------------------------------
     def _store(

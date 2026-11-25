@@ -32,6 +32,7 @@ from .shell import (
     shell_command_signature,
     workspace_path,
 )
+from .scope import scope_from_chat, scope_from_profile
 from .team import TeamError, parse_chat_context
 from .vault import EntryNotFound, VaultLocked, host_matches
 
@@ -345,27 +346,97 @@ class ToolKit:
         return {"deleted_task_id": task_id}
 
     # -- memory -----------------------------------------------------------
+    def _lead_only_read(self, chat_id: str, args: Dict[str, Any]) -> Optional[str]:
+        """Resolve an optional ``agent`` read target (team lead only)."""
+        requested = str(args.get("agent") or args.get("agent_id") or "").strip()
+        if not requested:
+            return None
+        me, _task = parse_chat_context(chat_id)
+        if me:
+            raise ValueError(
+                "Memory and skills are private to each agent. Only the team "
+                "lead can inspect another agent's notes (read-only)."
+            )
+        profile = self._resolve_team_agent({"agent": requested})
+        return scope_from_profile(profile)
+
     async def remember(self, args: Dict[str, Any], chat_id: str) -> Any:
         fact = _require_text(args, "fact", 1000)
-        self.services.db.execute(
-            "INSERT INTO memories (content, source, created_at) VALUES (?, ?, ?)",
-            (fact, chat_id, time.time()),
-        )
-        return {"stored": True}
+        scope = scope_from_chat(chat_id)
+        self.services.memories.remember(scope, fact, chat_id)
+        return {
+            "stored": True,
+            "scope": scope,
+            "note": "Private to your own memory; other agents cannot recall it.",
+        }
 
     async def recall(self, args: Dict[str, Any], chat_id: str) -> Any:
         query = str(args.get("query", "")).strip()[:200]
-        if query:
-            rows = self.services.db.query(
-                "SELECT content, created_at FROM memories WHERE content LIKE ? "
-                "ORDER BY id DESC LIMIT 10",
-                ("%" + query + "%",),
+        scope = self._lead_only_read(chat_id, args) or scope_from_chat(chat_id)
+        rows = self.services.memories.recall(scope, query, 10)
+        return {"scope": scope, "memories": [row["content"] for row in rows]}
+
+    # -- skills -----------------------------------------------------------
+    def _skill_read_scope(self, chat_id: str, args: Dict[str, Any]) -> str:
+        return self._lead_only_read(chat_id, args) or scope_from_chat(chat_id)
+
+    async def skill_save(self, args: Dict[str, Any], chat_id: str) -> Any:
+        skill = self.services.skills.save(
+            scope_from_chat(chat_id),
+            _require_text(args, "name", 80),
+            _require_text(args, "instructions", 8000),
+            str(args.get("summary") or ""),
+        )
+        return {
+            "saved": True,
+            "skill": {
+                "name": skill.get("name"),
+                "summary": skill.get("summary"),
+            },
+            "note": (
+                "Private to you. Use skill_use(name) later to reload the full "
+                "instructions."
+            ),
+        }
+
+    async def skill_list(self, args: Dict[str, Any], chat_id: str) -> Any:
+        scope = self._skill_read_scope(chat_id, args)
+        rows = self.services.skills.list(scope, 50)
+        return {
+            "scope": scope,
+            "skills": [
+                {"name": row["name"], "summary": row["summary"]} for row in rows
+            ],
+        }
+
+    async def skill_use(self, args: Dict[str, Any], chat_id: str) -> Any:
+        name = _require_text(args, "name", 80)
+        scope = self._skill_read_scope(chat_id, args)
+        skill = self.services.skills.get(scope, name)
+        if not skill:
+            raise ValueError(
+                "No skill named %r in this scope. Use skill_list to see the "
+                "available names." % name
             )
-        else:
-            rows = self.services.db.query(
-                "SELECT content, created_at FROM memories ORDER BY id DESC LIMIT 10"
+        return {
+            "name": skill["name"],
+            "summary": skill["summary"],
+            "instructions": skill["instructions"],
+        }
+
+    async def skill_delete(self, args: Dict[str, Any], chat_id: str) -> Any:
+        me, _task = parse_chat_context(chat_id)
+        requested = str(args.get("agent") or "").strip()
+        if requested and not me:
+            raise ValueError(
+                "Skills can only be changed by their owner; the team lead can "
+                "only read another agent's skills."
             )
-        return {"memories": [row["content"] for row in rows]}
+        name = _require_text(args, "name", 80)
+        removed = self.services.skills.delete(scope_from_chat(chat_id), name)
+        if not removed:
+            raise ValueError("No skill named %r to delete." % name)
+        return {"deleted": name}
 
     # -- shell ------------------------------------------------------------
     async def run_shell(self, args: Dict[str, Any], chat_id: str) -> Any:
@@ -1205,17 +1276,99 @@ class ToolKit:
             "remember": ToolSpec(
                 name="remember",
                 description=(
-                    "Store a durable fact about the user (preferences, recurring "
-                    "context). Never store secrets or passwords."
+                    "Store a durable fact in your own private memory. Each agent "
+                    "(and the team lead) has a separate memory; other agents "
+                    "cannot recall what you store here. Never store secrets or "
+                    "passwords."
                 ),
                 parameters=_obj({"fact": _str("The fact to remember.")}, ["fact"]),
                 handler=self.remember,
             ),
             "recall": ToolSpec(
                 name="recall",
-                description="Search stored facts about the user.",
-                parameters=_obj({"query": _str("Search terms; empty = recent.")}),
+                description=(
+                    "Search your own private memory. Team lead only: pass "
+                    "agent=<id or name> to read another agent's memory "
+                    "(read-only, for debugging)."
+                ),
+                parameters=_obj(
+                    {
+                        "query": _str("Search terms; empty = recent."),
+                        "agent": _str(
+                            "Lead only: agent id or name whose memory to read."
+                        ),
+                    }
+                ),
                 handler=self.recall,
+            ),
+            "skill_save": ToolSpec(
+                name="skill_save",
+                description=(
+                    "Save or update a reusable skill (a procedure, checklist or "
+                    "recipe) in your own private skill set. Only you can use it; "
+                    "other agents keep their own skills. Saving an existing name "
+                    "overwrites it."
+                ),
+                parameters=_obj(
+                    {
+                        "name": _str("Short unique name, e.g. 'weekly-sales-report'."),
+                        "instructions": _str(
+                            "Full step-by-step instructions to follow when the "
+                            "skill is used."
+                        ),
+                        "summary": _str(
+                            "One-line description shown in the prompt (defaults "
+                            "to the first line of the instructions)."
+                        ),
+                    },
+                    ["name", "instructions"],
+                ),
+                handler=self.skill_save,
+            ),
+            "skill_list": ToolSpec(
+                name="skill_list",
+                description=(
+                    "List the names and summaries of your own skills. Team lead "
+                    "only: pass agent=<id or name> to read another agent's "
+                    "skills (read-only)."
+                ),
+                parameters=_obj(
+                    {
+                        "agent": _str(
+                            "Lead only: agent id or name whose skills to read."
+                        )
+                    }
+                ),
+                handler=self.skill_list,
+            ),
+            "skill_use": ToolSpec(
+                name="skill_use",
+                description=(
+                    "Load the full instructions of one of your own skills before "
+                    "following it. Team lead only: pass agent=<id or name> to "
+                    "read another agent's skill (read-only)."
+                ),
+                parameters=_obj(
+                    {
+                        "name": _str("Skill name from skill_list."),
+                        "agent": _str(
+                            "Lead only: agent id or name whose skill to read."
+                        ),
+                    },
+                    ["name"],
+                ),
+                handler=self.skill_use,
+            ),
+            "skill_delete": ToolSpec(
+                name="skill_delete",
+                description=(
+                    "Delete one of your own skills by name. Only the owner "
+                    "(you) can delete it."
+                ),
+                parameters=_obj(
+                    {"name": _str("Skill name to delete.")}, ["name"]
+                ),
+                handler=self.skill_delete,
             ),
         }
 

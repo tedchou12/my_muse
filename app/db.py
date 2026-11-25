@@ -133,8 +133,21 @@ CREATE TABLE IF NOT EXISTS memories (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     content    TEXT NOT NULL,
     source     TEXT NOT NULL DEFAULT '',
+    scope      TEXT NOT NULL DEFAULT 'lead',
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_skills (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope        TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    UNIQUE(scope, name)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_skills_scope ON agent_skills(scope, id);
 
 CREATE TABLE IF NOT EXISTS artifacts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +263,23 @@ class Database:
         if "trusted_commands" not in agent_columns:
             self._conn.execute(
                 "ALTER TABLE agents ADD COLUMN trusted_commands TEXT NOT NULL DEFAULT '[]'"
+            )
+        memory_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(memories)")
+        }
+        if "scope" not in memory_columns:
+            from .scope import scope_from_source
+
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'lead'"
+            )
+            rows = self._conn.execute("SELECT id, source FROM memories").fetchall()
+            self._conn.executemany(
+                "UPDATE memories SET scope = ? WHERE id = ?",
+                [
+                    (scope_from_source(row["source"]), row["id"])
+                    for row in rows
+                ],
             )
 
     # -- low level --------------------------------------------------------

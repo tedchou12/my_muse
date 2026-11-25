@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from .browser import BrowserError, BrowserUnavailable
 from .providers import ALLOWED_PRESETS
 from .credentials import CredentialRequestError
 from .scheduler import ScheduleError
+from .scope import LEAD_SCOPE, scope_for_agent
 from .team import (
     AgentNotFound,
     DuplicateAgent,
@@ -786,6 +788,148 @@ async def list_team_agents(
     _: str = Depends(require_auth),
 ) -> Dict[str, Any]:
     return {"agents": services.team.list_agents()}
+
+
+def _owner_scope(services: Services, agent: str) -> str:
+    """Map the Team tab's ``agent`` selector to a private memory/skill scope."""
+    raw = str(agent or "").strip()
+    lead_aliases = {"", "lead", "team lead", "muse", "owner", "0"}
+    lead_name = str(services.team.lead_name() or "").strip().lower()
+    if raw.lower() in lead_aliases or (lead_name and raw.lower() == lead_name):
+        return LEAD_SCOPE
+    try:
+        agent_id = int(raw)
+    except (TypeError, ValueError):
+        agent_id = 0
+    try:
+        profile = (
+            services.team.get_agent(agent_id)
+            if agent_id
+            else services.team.get_agent(name=raw)
+        )
+    except TeamError:
+        raise HTTPException(status_code=404, detail="Unknown agent.")
+    return scope_for_agent(int(profile["id"]))
+
+
+class SkillIn(BaseModel):
+    agent: str = Field(default="", max_length=80)
+    name: str = Field(min_length=1, max_length=80)
+    summary: str = Field(default="", max_length=200)
+    instructions: str = Field(min_length=1, max_length=8000)
+
+
+class SkillUpdateIn(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=80)
+    summary: Optional[str] = Field(default=None, max_length=200)
+    instructions: Optional[str] = Field(default=None, max_length=8000)
+
+
+@router.get("/api/team/memory")
+async def list_team_memory(
+    agent: str = Query(default=""),
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    scope = _owner_scope(services, agent)
+    return {"scope": scope, "memories": services.memories.list_scope(scope, 200)}
+
+
+@router.delete("/api/team/memory/{memory_id}")
+async def delete_team_memory(
+    memory_id: int,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    if not services.memories.delete(memory_id):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    services.audit.log("user", "memory_delete", {"memory_id": memory_id})
+    return {"ok": True}
+
+
+@router.get("/api/team/skills")
+async def list_team_skills(
+    agent: str = Query(default=""),
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    scope = _owner_scope(services, agent)
+    return {"scope": scope, "skills": services.skills.list(scope, 100)}
+
+
+@router.get("/api/team/skills/{skill_id}")
+async def get_team_skill(
+    skill_id: int,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    skill = services.skills.get_by_id(skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found.")
+    return {"skill": skill}
+
+
+@router.post("/api/team/skills")
+async def create_team_skill(
+    payload: SkillIn,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    scope = _owner_scope(services, payload.agent)
+    try:
+        skill = services.skills.save(
+            scope, payload.name, payload.instructions, payload.summary
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    services.audit.log(
+        "user", "skill_save", {"scope": scope, "name": skill.get("name")}
+    )
+    return {"skill": skill}
+
+
+@router.put("/api/team/skills/{skill_id}")
+async def update_team_skill(
+    skill_id: int,
+    payload: SkillUpdateIn,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    current = services.skills.get_by_id(skill_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Skill not found.")
+    try:
+        skill = services.skills.update(
+            skill_id, payload.model_dump(exclude_unset=True)
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=409, detail="That owner already has a skill with this name."
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found.")
+    services.audit.log(
+        "user", "skill_update", {"scope": skill["scope"], "name": skill["name"]}
+    )
+    return {"skill": skill}
+
+
+@router.delete("/api/team/skills/{skill_id}")
+async def delete_team_skill(
+    skill_id: int,
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    current = services.skills.get_by_id(skill_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Skill not found.")
+    services.skills.delete_by_id(skill_id)
+    services.audit.log(
+        "user", "skill_delete", {"scope": current["scope"], "name": current["name"]}
+    )
+    return {"ok": True}
 
 
 @router.patch("/api/team/agents/{agent_id}")

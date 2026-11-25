@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .audit import AuditLog
 from .config import Settings
 from .db import Database
+from .scope import LEAD_SCOPE
 
 logger = logging.getLogger("muse.team")
 
@@ -969,8 +970,17 @@ class TeamStore:
             "LEFT JOIN agents t ON t.id = m.to_agent_id "
             "ORDER BY m.id DESC LIMIT 40"
         )
+        memory_counts, skill_counts = self.scope_counts()
+        for agent in agents:
+            scope = "agent:%d" % int(agent["id"])
+            agent["memory_count"] = memory_counts.get(scope, 0)
+            agent["skill_count"] = skill_counts.get(scope, 0)
+        lead = self.lead_profile()
+        lead["memory_count"] = memory_counts.get(LEAD_SCOPE, 0)
+        lead["skill_count"] = skill_counts.get(LEAD_SCOPE, 0)
         return {
             "agents": agents,
+            "lead": lead,
             "tasks": tasks,
             "messages": list(reversed(messages)),
             "limits": {
@@ -979,6 +989,22 @@ class TeamStore:
                 "auto_run": bool(self.settings.team_auto_run),
             },
         }
+
+    def scope_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Memory and skill counts per owner scope, for the Team tab badges."""
+        memory = {
+            str(row["scope"]): int(row["n"])
+            for row in self.db.query(
+                "SELECT scope, COUNT(*) AS n FROM memories GROUP BY scope"
+            )
+        }
+        skills = {
+            str(row["scope"]): int(row["n"])
+            for row in self.db.query(
+                "SELECT scope, COUNT(*) AS n FROM agent_skills GROUP BY scope"
+            )
+        }
+        return memory, skills
 
     def summary(self) -> Dict[str, Any]:
         return {

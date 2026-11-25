@@ -1531,6 +1531,7 @@ async function loadTeam() {
     state.agents = data.agents || [];
     renderAgentNav();
     loadGroups();
+    renderTeamLead(data.lead || null);
     renderTeamAgents(data.agents || []);
     renderTeamTasks(data.tasks || []);
     if (state.teamTaskId) {
@@ -1564,6 +1565,215 @@ function parseTrustedCommands(raw) {
   return [];
 }
 
+function scopePanelHtml(owner, memoryCount, skillCount) {
+  return (
+    '<details class="scope-panel" data-owner="' +
+    esc(owner) +
+    '"><summary>Memory (' +
+    esc(memoryCount || 0) +
+    ") · Skills (" +
+    esc(skillCount || 0) +
+    ')</summary><div class="scope-body"><div class="muted small">Loading…</div></div></details>'
+  );
+}
+
+function bindScopePanels(root) {
+  if (!root) return;
+  root.querySelectorAll("details.scope-panel").forEach((panel) => {
+    if (panel.dataset.bound === "1") return;
+    panel.dataset.bound = "1";
+    panel.addEventListener("toggle", () => {
+      if (panel.open && panel.dataset.loaded !== "1") loadScopePanel(panel);
+    });
+  });
+}
+
+async function loadScopePanel(panel) {
+  panel.dataset.loaded = "1";
+  const body = panel.querySelector(".scope-body");
+  if (!body) return;
+  body.innerHTML = '<div class="muted small">Loading…</div>';
+  const owner = panel.dataset.owner || "lead";
+  try {
+    const [memories, skills] = await Promise.all([
+      api("/api/team/memory?agent=" + encodeURIComponent(owner)),
+      api("/api/team/skills?agent=" + encodeURIComponent(owner)),
+    ]);
+    renderScopeBody(panel, owner, memories.memories || [], skills.skills || []);
+  } catch (error) {
+    panel.dataset.loaded = "";
+    body.innerHTML = '<div class="muted small">' + esc(error.message) + "</div>";
+  }
+}
+
+function refreshScopePanel(panel) {
+  if (!panel) return;
+  panel.dataset.loaded = "";
+  loadScopePanel(panel);
+}
+
+function renderScopeBody(panel, owner, memories, skills) {
+  const body = panel.querySelector(".scope-body");
+  if (!body) return;
+  const summary = panel.querySelector("summary");
+  if (summary) {
+    summary.textContent =
+      "Memory (" + memories.length + ") · Skills (" + skills.length + ")";
+  }
+  const memHtml = memories.length
+    ? memories
+        .map(
+          (memory) =>
+            '<div class="scope-row"><div class="grow"><div class="small">' +
+            esc(memory.content) +
+            '</div><div class="muted small">' +
+            esc(fmtTime(memory.created_at)) +
+            '</div></div><button class="link" type="button" data-scope-mem-del="' +
+            esc(memory.id) +
+            '">Delete</button></div>'
+        )
+        .join("")
+    : '<div class="muted small">No memories yet.</div>';
+  const skillHtml = skills.length
+    ? skills
+        .map(
+          (skill) =>
+            '<div class="scope-row"><div class="grow"><strong>' +
+            esc(skill.name) +
+            '</strong> <span class="muted small">' +
+            esc(skill.summary) +
+            '</span><pre class="detail skill-text hidden" id="skill-text-' +
+            esc(skill.id) +
+            '"></pre></div><div class="controls">' +
+            '<button class="link" type="button" data-scope-skill-view="' +
+            esc(skill.id) +
+            '">View</button>' +
+            '<button class="link" type="button" data-scope-skill-edit="' +
+            esc(skill.id) +
+            '">Edit</button>' +
+            '<button class="link" type="button" data-scope-skill-del="' +
+            esc(skill.id) +
+            '">Delete</button></div></div>'
+        )
+        .join("")
+    : '<div class="muted small">No skills yet.</div>';
+  body.innerHTML =
+    '<h5 class="scope-title">Memory</h5>' +
+    memHtml +
+    '<h5 class="scope-title">Skills</h5>' +
+    skillHtml +
+    '<form class="scope-add form-grid" data-owner="' +
+    esc(owner) +
+    '">' +
+    '<label>New skill name<input name="name" maxlength="80" required placeholder="weekly-sales-report"></label>' +
+    '<label>Summary (optional)<input name="summary" maxlength="200" placeholder="One-line description"></label>' +
+    '<label class="wide">Instructions<textarea name="instructions" rows="3" maxlength="8000" required placeholder="Step-by-step procedure"></textarea></label>' +
+    '<div class="wide actions"><button class="primary" type="submit">Save skill</button></div>' +
+    "</form>";
+}
+
+async function onScopeAction(event) {
+  const delMemory = event.target.closest("[data-scope-mem-del]");
+  const viewSkill = event.target.closest("[data-scope-skill-view]");
+  const editSkill = event.target.closest("[data-scope-skill-edit]");
+  const delSkill = event.target.closest("[data-scope-skill-del]");
+  const panel = event.target.closest("details.scope-panel");
+  if (!panel) return;
+  try {
+    if (delMemory) {
+      if (!window.confirm("Delete this memory?")) return;
+      await api("/api/team/memory/" + delMemory.dataset.scopeMemDel, {
+        method: "DELETE",
+      });
+      refreshScopePanel(panel);
+      return;
+    }
+    if (viewSkill) {
+      const id = viewSkill.dataset.scopeSkillView;
+      const box = panel.querySelector("#skill-text-" + id);
+      if (box && !box.classList.contains("hidden")) {
+        box.classList.add("hidden");
+        return;
+      }
+      if (box && !box.dataset.filled) {
+        const data = await api("/api/team/skills/" + id);
+        box.textContent = data.skill.instructions || "";
+        box.dataset.filled = "1";
+      }
+      if (box) box.classList.remove("hidden");
+      return;
+    }
+    if (editSkill) {
+      const id = editSkill.dataset.scopeSkillEdit;
+      const data = await api("/api/team/skills/" + id);
+      const skill = data.skill;
+      const summary = window.prompt("One-line summary:", skill.summary || "");
+      if (summary === null) return;
+      const instructions = window.prompt(
+        "Instructions (step by step):",
+        skill.instructions || ""
+      );
+      if (instructions === null) return;
+      await api("/api/team/skills/" + id, {
+        method: "PUT",
+        body: { summary: summary, instructions: instructions },
+      });
+      toast("Skill updated.");
+      refreshScopePanel(panel);
+      return;
+    }
+    if (delSkill) {
+      if (!window.confirm("Delete this skill?")) return;
+      await api("/api/team/skills/" + delSkill.dataset.scopeSkillDel, {
+        method: "DELETE",
+      });
+      refreshScopePanel(panel);
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function onScopeAdd(event) {
+  const form = event.target.closest("form.scope-add");
+  if (!form) return;
+  event.preventDefault();
+  const panel = form.closest("details.scope-panel");
+  const data = new FormData(form);
+  try {
+    await api("/api/team/skills", {
+      method: "POST",
+      body: {
+        agent: form.dataset.owner || "lead",
+        name: (data.get("name") || "").toString().trim(),
+        summary: (data.get("summary") || "").toString().trim(),
+        instructions: (data.get("instructions") || "").toString().trim(),
+      },
+    });
+    toast("Skill saved for this owner.");
+    refreshScopePanel(panel);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderTeamLead(lead) {
+  const list = $("#lead-card");
+  if (!list) return;
+  if (!lead) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML =
+    '<div class="item"><div class="grow"><h4>' +
+    esc(lead.name || "Team lead") +
+    ' <span class="badge">lead</span></h4>' +
+    '<div class="meta">Owns the main chat and the shared task board. Memory and skills here are private to the lead; only the lead can read other agents\' notes.</div>' +
+    scopePanelHtml("lead", lead.memory_count, lead.skill_count) +
+    "</div></div>";
+  bindScopePanels(list);
+}
+
 function renderTeamAgents(agents) {
   const list = $("#bot-list");
   list.innerHTML = agents.length
@@ -1595,7 +1805,9 @@ function renderTeamAgents(agents) {
             " done</div>" +
             '<pre class="detail">' +
             esc((agent.instructions || "").slice(0, 500)) +
-            "</pre></div>" +
+            "</pre>" +
+            scopePanelHtml(agent.id, agent.memory_count, agent.skill_count) +
+            "</div>" +
             '<div class="controls">' +
             (agent.status === "active"
               ? '<button class="ghost" data-bot-action="chat" data-id="' +
@@ -1647,6 +1859,7 @@ function renderTeamAgents(agents) {
   if (current && active.some((agent) => String(agent.id) === current)) {
     select.value = current;
   }
+  bindScopePanels(list);
 }
 
 function renderTeamTasks(tasks) {
@@ -3558,6 +3771,10 @@ function bindEvents() {
   $("#bot-form").addEventListener("submit", createBot);
   $("#team-task-form").addEventListener("submit", createTeamTask);
   $("#bot-list").addEventListener("click", onTeamAction);
+  $("#bot-list").addEventListener("click", onScopeAction);
+  $("#lead-card").addEventListener("click", onScopeAction);
+  $("#bot-list").addEventListener("submit", onScopeAdd);
+  $("#lead-card").addEventListener("submit", onScopeAdd);
   $("#team-task-list").addEventListener("click", onTeamAction);
   $("#team-refresh").addEventListener("click", loadTeam);
   $("#team-thread-close").addEventListener("click", () => {

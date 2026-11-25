@@ -26,10 +26,12 @@ from .chat_queue import ChatQueue
 from .config import Settings
 from .credentials import CredentialRequestQueue
 from .db import Database
+from .memory import MemoryStore
 from .openai_client import OpenAIService
 from .providers import ProviderStore
 from .scheduler import Scheduler
 from .services import Services
+from .skills import SkillStore
 from .team import TeamRunner, TeamStore
 from .tools import ToolKit
 from .trust import TrustedHosts
@@ -122,6 +124,8 @@ def build_services(settings: Settings) -> Services:
         openai=openai_service,
         approvals=approvals,
         scheduler=scheduler,
+        memories=MemoryStore(db),
+        skills=SkillStore(db),
     )
     services.team = TeamStore(db, audit, settings, openai_service, prefs)
     services.team_runner = TeamRunner(services)
