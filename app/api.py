@@ -709,6 +709,22 @@ async def cancel_chat(
     return {"cancelled": cancelled}
 
 
+@router.get("/api/chat/latest")
+async def chat_latest(
+    services: Services = Depends(get_services),
+    _: str = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Newest message per visible chat, so the UI can flag background posts."""
+    rows = services.db.query(
+        "SELECT m.chat_id, m.id, m.role, m.created_at FROM messages m "
+        "JOIN (SELECT chat_id, MAX(id) AS id FROM messages "
+        "      WHERE chat_id = 'default' OR chat_id GLOB 'agent:*:dm' "
+        "      GROUP BY chat_id) latest ON latest.id = m.id "
+        "ORDER BY m.id DESC"
+    )
+    return {"chats": rows}
+
+
 @router.get("/api/chat/history")
 async def chat_history(
     chat_id: str = Query("default", pattern=r"^[A-Za-z0-9:_-]{1,100}$"),

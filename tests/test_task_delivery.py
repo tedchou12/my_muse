@@ -42,6 +42,21 @@ async def test_failed_scheduled_result_is_flagged_in_chat(app):
     assert "FAILED" in content
     assert "boom" in content
 
+def test_chat_latest_exposes_background_posts(app, auth_client):
+    services = app.state.services
+    agent = services.team.create_agent("Jennifer", "Assistant", "Check in.")
+    services.agent.attach("default", "Lead note.")
+    services.agent.attach("agent:%d:dm" % agent["id"], "Jennifer note.")
+    services.agent.attach("task:9", "Private run transcript.")
+
+    rows = auth_client.get("/api/chat/latest").json()["chats"]
+    by_chat = {row["chat_id"]: row for row in rows}
+    assert by_chat["default"]["role"] == "assistant"
+    assert by_chat["agent:%d:dm" % agent["id"]]["role"] == "assistant"
+    assert "task:9" not in by_chat
+    assert all(row["id"] for row in rows)
+
+
 async def test_scheduled_agent_task_runs_under_the_agent_identity(app, monkeypatch):
     services = app.state.services
     agent = services.team.create_agent("Jennifer", "Assistant", "Check in.")

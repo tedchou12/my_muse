@@ -29,7 +29,8 @@ const state = {
   groupTimer: null,
   badgeTimer: null,
   chatUpdatesTimer: null,
-  chatLastId: null,
+  seenChats: {},
+  unreadChats: {},
   chatTimer: null,
   provider: null,
   providerPreset: null,
@@ -435,6 +436,7 @@ function renderAgentNav() {
     esc(leadName) +
     "</strong><small>Team lead</small></span>" +
     (state.runs.default ? '<span class="pill warn">running</span>' : "") +
+    (state.unreadChats.default ? '<span class="pill">new</span>' : "") +
     "</button>";
   const activeAgents = (state.agents || []).filter(
     (agent) => agent.status === "active"
@@ -464,6 +466,9 @@ function renderAgentNav() {
           ? '<span class="pill warn">running</span>'
           : open
           ? '<span class="pill warn">' + open + "</span>"
+          : "") +
+        (state.unreadChats["agent:" + agent.id + ":dm"]
+          ? '<span class="pill">new</span>'
           : "") +
         "</button>"
       );
@@ -641,9 +646,11 @@ async function loadChat() {
       api("/api/approvals"),
     ]);
     const chatMessages = data.messages || [];
-    state.chatLastId = chatMessages.length
+    const newest = chatMessages.length
       ? chatMessages[chatMessages.length - 1].id
       : null;
+    if (newest) state.seenChats[state.chatId] = newest;
+    delete state.unreadChats[state.chatId];
     renderChat(chatMessages);
     (creds.requests || []).forEach(appendCredentialCard);
     (approvals.pending || [])
@@ -659,6 +666,7 @@ async function loadChat() {
       delete state.chatErrors[state.chatId];
     }
     updateChatHeader();
+    renderAgentNav();
     restoreChatRun();
     await syncChatRunState();
   } catch (error) {
@@ -786,37 +794,60 @@ function stopChatUpdatesPolling() {
   }
 }
 
+function agentNameById(id) {
+  const agent = (state.agents || []).find(
+    (item) => Number(item.id) === Number(id)
+  );
+  return agent ? agent.name : "agent #" + id;
+}
+
+function chatName(chatId) {
+  if (!chatId || chatId === "default") {
+    return (state.session && state.session.agent_name) || "Muse";
+  }
+  const match = /^agent:(\d+):dm$/.exec(chatId);
+  return match ? agentNameById(match[1]) : chatId;
+}
+
+async function refreshChatUpdates() {
+  if (!state.session || state.chatGroup) return;
+  if (state.runs[state.chatId]) return; // the run poller already refreshes
+  try {
+    const data = await api("/api/chat/latest");
+    let changed = false;
+    (data.chats || []).forEach((row) => {
+      const chatId = row.chat_id;
+      const seen = state.seenChats[chatId];
+      if (seen === undefined) {
+        state.seenChats[chatId] = row.id;
+        return;
+      }
+      if (Number(row.id) <= Number(seen)) return;
+      state.seenChats[chatId] = row.id;
+      changed = true;
+      if (chatId === state.chatId) {
+        if (state.tab === "chat") loadChat();
+        return;
+      }
+      state.unreadChats[chatId] = true;
+      if (row.role === "assistant") {
+        toast("New message from " + chatName(chatId) + ".");
+      }
+    });
+    if (changed) {
+      renderAgentNav();
+      refreshBadges();
+    }
+  } catch (error) {
+    /* transient network errors must not stop the poller */
+  }
+}
+
 function startChatUpdatesPolling() {
   if (state.chatUpdatesTimer) return;
   // Background runs (scheduled tasks, team runners) append messages without a
-  // local run, so poll the open chat for new rows even when nothing is active.
-  state.chatUpdatesTimer = setInterval(async () => {
-    if (!state.session || state.chatGroup) return;
-    if (state.runs[state.chatId]) return; // the run poller already refreshes
-    try {
-      const data = await api(
-        "/api/chat/history?chat_id=" +
-          encodeURIComponent(state.chatId) +
-          "&limit=1"
-      );
-      const messages = data.messages || [];
-      const newest = messages.length ? messages[messages.length - 1] : null;
-      if (!newest || newest.id === state.chatLastId) return;
-      state.chatLastId = newest.id;
-      if (state.tab === "chat") {
-        await loadChat();
-        return;
-      }
-      const agent = currentChatAgent();
-      const name = agent
-        ? agent.name
-        : (state.session && state.session.agent_name) || "Muse";
-      toast("New message from " + name + ".");
-      await refreshBadges();
-    } catch (error) {
-      /* transient network errors must not stop the poller */
-    }
-  }, 8000);
+  // local run, so poll every visible chat for new rows.
+  state.chatUpdatesTimer = setInterval(refreshChatUpdates, 8000);
 }
 
 function startChatPolling() {
@@ -913,7 +944,6 @@ function setGroupTarget(group) {
 
 function setChatTarget(agent, load = true) {
   state.chatGroup = null;
-  state.chatLastId = null;
   stopGroupPolling();
   if (agent) {
     state.chatAgentId = Number(agent.id);
