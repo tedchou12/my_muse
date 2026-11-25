@@ -187,6 +187,71 @@ async def test_shell_secret_field_selector(app):
     assert "agent-user" not in json.dumps(result)
 
 
+async def test_lead_can_change_agent_model(app):
+    services = app.state.services
+    services.prefs.update({"auto_approve_writes": True})
+    agent = services.team.create_agent(
+        "Scout", "Runner", "Do it.", model="qwen3.8-flash"
+    )
+    result = await execute_tool(
+        services,
+        "set_agent_model",
+        {"agent": "Scout", "model": "beam-free"},
+        chat_id="default",
+    )
+    assert result["ok"] is True, result
+    payload = result["result"]
+    assert payload["previous_model"] == "qwen3.8-flash"
+    assert payload["model"] == "beam-free"
+    assert services.team.get_agent(agent["id"])["model"] == "beam-free"
+
+    cleared = await execute_tool(
+        services,
+        "set_agent_model",
+        {"agent": "Scout", "model": ""},
+        chat_id="default",
+    )
+    assert cleared["ok"] is True, cleared
+    assert cleared["result"]["model"] == ""
+    assert services.team.get_agent(agent["id"])["model"] == ""
+
+
+async def test_named_agents_cannot_change_models(app):
+    services = app.state.services
+    services.prefs.update({"auto_approve_writes": True})
+    scout = services.team.create_agent("Scout", "Runner", "Do it.")
+    scribe = services.team.create_agent("Scribe", "Runner", "Write it.")
+    denied = await execute_tool(
+        services,
+        "set_agent_model",
+        {"agent": "Scribe", "model": "beam-free"},
+        chat_id="agent:%d:dm" % scout["id"],
+    )
+    assert "Only the team lead" in denied["error"]
+    assert services.team.get_agent(scribe["id"])["model"] == ""
+
+    lead = await execute_tool(
+        services,
+        "set_agent_model",
+        {"agent": "Muse", "model": "beam-free"},
+        chat_id="default",
+    )
+    assert "team lead itself" in lead["error"]
+
+
+async def test_model_change_needs_approval(app):
+    services = app.state.services
+    services.prefs.update({"auto_approve_writes": False})
+    services.team.create_agent("Scout", "Runner", "Do it.")
+    result = await execute_tool(
+        services,
+        "set_agent_model",
+        {"agent": "Scout", "model": "beam-free"},
+        chat_id="default",
+    )
+    assert result.get("status") == "pending_approval"
+
+
 async def test_convert_time_reports_et_and_jst(app):
     services = app.state.services
     result = await execute_tool(

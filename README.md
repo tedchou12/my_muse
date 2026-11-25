@@ -943,7 +943,11 @@ Deliberately out of scope for v0.1:
 - The **team lead** is whatever name you set in Settings (formerly "Muse").
   Teammates can message it by its current name (or "lead"/"team lead"), its
   inbox is the normal chat, group threads show the current name, and it cannot
-  be a task assignee — agents report to it with `send_message`.
+  be a task assignee — agents report to it with `send_message`. The lead can
+  retarget any agent's model with `set_agent_model` (for example to move a
+  simple bot onto a free model, or an empty model to restore the provider
+  default); named agents cannot change models, and the change is approval-gated
+  and audited.
 - **Scheduled tasks carry their context.** When you schedule a task, the last
   few chat turns are stored with it and injected into the prompt when it fires,
   so an automation does not depend on chat memory it cannot see.

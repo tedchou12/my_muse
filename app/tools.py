@@ -775,6 +775,40 @@ class ToolKit:
             ),
         }
 
+    async def set_agent_model(self, args: Dict[str, Any], chat_id: str) -> Any:
+        """Team lead only: pin (or clear) the model of any named agent."""
+        me, _task = parse_chat_context(chat_id)
+        if me:
+            raise ValueError(
+                "Only the team lead can change another agent's model. Ask the "
+                "lead to do it."
+            )
+        agent = self._resolve_team_agent(args)
+        if int(agent.get("id") or 0) == 0:
+            raise ValueError(
+                "That is the team lead itself; its model comes from the Provider "
+                "tab, not from an agent profile."
+            )
+        model = str(args.get("model") or "").strip()[:160]
+        previous = str(agent.get("model") or "")
+        updated = self.services.team.update_agent(
+            int(agent["id"]), {"model": model}, actor="lead"
+        )
+        current = updated.get("model") or ""
+        return {
+            "agent_id": updated["id"],
+            "name": updated["name"],
+            "previous_model": previous,
+            "model": current,
+            "message": (
+                "%s now runs on %s."
+                % (
+                    updated["name"],
+                    current or "the provider's default model",
+                )
+            ),
+        }
+
     async def create_agent(self, args: Dict[str, Any], chat_id: str) -> Any:
         brief = _require_text(args, "brief")
         name = str(args.get("name") or "").strip()[:60] or None
@@ -994,6 +1028,29 @@ class ToolKit:
                     }
                 ),
                 handler=self.rename_self,
+            ),
+            "set_agent_model": ToolSpec(
+                name="set_agent_model",
+                description=(
+                    "Team lead only. Change which model a named agent runs on "
+                    "(pass the agent id/name and a model id; an empty model "
+                    "restores the provider default). Use it to move simple bots "
+                    "to a cheaper model or to upgrade one that needs more "
+                    "capability. This is a configuration change and needs "
+                    "approval."
+                ),
+                parameters=_obj(
+                    {
+                        "agent": _str("Agent id or exact name."),
+                        "model": _str(
+                            "Model id, e.g. hy4-flash-free. Empty string resets "
+                            "to the provider default."
+                        ),
+                    },
+                    ["agent", "model"],
+                ),
+                handler=self.set_agent_model,
+                side_effect=True,
             ),
             "create_agent": ToolSpec(
                 name="create_agent",

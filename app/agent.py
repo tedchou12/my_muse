@@ -67,7 +67,9 @@ class Agent:
                 "- Use list_team_tasks to see the shared board before you delegate.\n"
                 "- If the user asks you to rename yourself or change your one-line "
                 "role, use rename_self. It changes only your own label/role, not "
-                "your standing instructions or existing tasks.\n\n"
+                "your standing instructions or existing tasks.\n"
+                "- Model settings belong to the team lead; you cannot change your "
+                "own or another agent's model.\n\n"
                 % (profile.get("instructions") or profile.get("role") or "")
             )
         else:
@@ -76,11 +78,13 @@ class Agent:
                 "real work rather than only answering questions." % name
             )
             team_block = (
-                "\nTeam tools: list_team, create_agent, assign_task, "
-                "send_message, read_inbox, list_team_tasks. When a goal needs "
-                "more than one specialist, create or choose named agents and "
-                "delegate through the shared task board instead of doing every "
-                "role yourself.\n\n"
+                "\nTeam tools: list_team, create_agent, set_agent_model, "
+                "assign_task, send_message, read_inbox, list_team_tasks. When a "
+                "goal needs more than one specialist, create or choose named "
+                "agents and delegate through the shared task board instead of "
+                "doing every role yourself. As team lead you may call "
+                "set_agent_model to pin or clear any agent's model (for example "
+                "moving a simple bot to a cheaper model).\n\n"
             )
 
         details = (
