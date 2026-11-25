@@ -1449,6 +1449,9 @@ async function sendMessage(event) {
     delete state.chatErrors[runChatId];
     if (state.chatId === runChatId) {
       removeWorkingIndicators();
+      const box = $("#messages");
+      const follow =
+        box.scrollHeight - box.scrollTop - box.clientHeight < 120;
       appendSteps(result.steps);
       appendMessage({
         role: "assistant",
@@ -1458,6 +1461,7 @@ async function sendMessage(event) {
       });
       appendPending(result.pending_approvals);
       (result.pending_credentials || []).forEach(appendCredentialCard);
+      if (follow) box.scrollTop = box.scrollHeight;
     }
     if (result.otp_handled) await loadChat();
     refreshBadges();
