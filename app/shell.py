@@ -341,6 +341,34 @@ def shell_command_signature(command: str) -> str:
     return str(command or "").strip()
 
 
+def shell_trusted_prefix(commands: Any, min_length: int = 8) -> str:
+    """Longest shared prefix of similar commands, trimmed to a word boundary.
+
+    Returns a pattern ending in ``*`` (ready for the trusted-command list) or an
+    empty string when the commands do not share a useful prefix.
+    """
+    texts = [" ".join(str(item or "").split()) for item in commands or []]
+    texts = [text for text in texts if text]
+    if len(texts) < 2:
+        return ""
+    prefix = texts[0]
+    for text in texts[1:]:
+        limit = min(len(prefix), len(text))
+        index = 0
+        while index < limit and prefix[index] == text[index]:
+            index += 1
+        prefix = prefix[:index]
+        if not prefix:
+            return ""
+    cut = prefix.rfind(" ")
+    if cut > 0:
+        prefix = prefix[:cut]
+    prefix = prefix.rstrip("'\"`").rstrip()
+    if len(prefix) < min_length:
+        return ""
+    return prefix + "*"
+
+
 class ShellError(RuntimeError):
     pass
 

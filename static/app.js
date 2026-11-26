@@ -1194,6 +1194,14 @@ function appendPending(pending) {
         esc(host) +
         "</button>"
       : "";
+    const trustPrefix =
+      item.tool === "run_shell"
+        ? '<button class="ghost" type="button" data-approval-action="trust-prefix" data-id="' +
+          esc(approvalId) +
+          '" data-prefix="' +
+          esc(item.suggested_prefix || "") +
+          '">Trust prefix…</button>'
+        : "";
     const div = document.createElement("div");
     div.className = "msg note approval-card";
     div.dataset.approvalCard = String(approvalId);
@@ -1208,6 +1216,7 @@ function appendPending(pending) {
       esc(approvalId) +
       '">Approve once</button>' +
       approveHost +
+      trustPrefix +
       '<button class="danger" type="button" data-approval-action="reject" data-id="' +
       esc(approvalId) +
       '">Reject</button>' +
@@ -3060,6 +3069,14 @@ function renderApprovals(pending, recent) {
               esc(host) +
               "</button>"
             : "";
+          const trustPrefix =
+            item.tool === "run_shell"
+              ? '<button class="ghost" data-approval-action="trust-prefix" data-id="' +
+                item.id +
+                '" data-prefix="' +
+                esc(item.suggested_prefix || "") +
+                '">Trust prefix…</button>'
+              : "";
           return (
             '<div class="item pending"><div class="grow"><h4>#' +
             item.id +
@@ -3079,6 +3096,7 @@ function renderApprovals(pending, recent) {
             item.id +
             '">Approve once</button>' +
             approveHost +
+            trustPrefix +
             '<button class="danger" data-approval-action="reject" data-id="' +
             item.id +
             '">Reject</button></div></div>'
@@ -3235,6 +3253,7 @@ async function onApprovalAction(event) {
   const card = button.closest("[data-approval-card]");
   let reason = "";
   let scope = "once";
+  let pattern = "";
 
   if (action === "reject") {
     reason = window.prompt("Reason for rejecting (optional):", "") || "";
@@ -3250,6 +3269,26 @@ async function onApprovalAction(event) {
       return;
     }
     scope = "host";
+  } else if (action === "trust-prefix") {
+    const suggested = button.dataset.prefix || "";
+    const answer = window.prompt(
+      "Run this command and trust future shell commands starting with:\n" +
+        "(keep the trailing * to trust a prefix; remove it to trust only this exact command)",
+      suggested
+    );
+    if (answer === null) return;
+    pattern = answer.trim();
+    if (!pattern) return;
+    if (
+      !window.confirm(
+        "Approve now and never ask again for shell commands starting with:\n\n" +
+          pattern +
+          "\n\nYou can revoke this in Approvals → Trusted commands."
+      )
+    ) {
+      return;
+    }
+    scope = "command";
   }
 
   button.disabled = true;
@@ -3262,7 +3301,7 @@ async function onApprovalAction(event) {
     } else {
       await api("/api/approvals/" + id + "/approve", {
         method: "POST",
-        body: { scope: scope },
+        body: { scope: scope, pattern: pattern },
       });
     }
     toast(
@@ -3270,6 +3309,8 @@ async function onApprovalAction(event) {
         ? "Rejected."
         : scope === "host"
         ? "Approved, trusted this host, and resumed."
+        : scope === "command"
+        ? "Approved and trusted that command prefix."
         : "Approved and resumed."
     );
     await loadApprovals();

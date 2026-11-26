@@ -39,7 +39,11 @@ from .security import (
     verify_session,
 )
 from .services import Services
-from .shell import shell_command_family, shell_command_signature
+from .shell import (
+    shell_command_family,
+    shell_command_signature,
+    shell_trusted_prefix,
+)
 from .tools import execute_approved
 from .uploads import (
     MAX_UPLOAD_BYTES,
@@ -312,7 +316,8 @@ class TrustedCommandIn(BaseModel):
 
 
 class ApprovalApproveIn(BaseModel):
-    scope: str = Field(default="once", pattern=r"^(once|host)$")
+    scope: str = Field(default="once", pattern=r"^(once|host|command)$")
+    pattern: Optional[str] = Field(default=None, max_length=500)
 
 
 class ProviderIn(BaseModel):
@@ -505,6 +510,39 @@ def _runner_for_chat(services: Services, chat_id: str) -> Any:
         except TeamError:
             pass
     return runner
+
+
+def _annotate_shell_prefixes(pending: List[Dict[str, Any]]) -> None:
+    """Suggest a trusted prefix for similar pending shell approvals."""
+    commands: Dict[str, List[str]] = {}
+    for item in pending:
+        if item.get("tool") != "run_shell":
+            continue
+        command = " ".join(
+            str((item.get("args") or {}).get("command") or "").split()
+        )
+        if command:
+            commands.setdefault(str(item.get("chat_id") or ""), []).append(command)
+    for item in pending:
+        if item.get("tool") != "run_shell":
+            continue
+        command = " ".join(
+            str((item.get("args") or {}).get("command") or "").split()
+        )
+        if not command:
+            continue
+        shared = shell_trusted_prefix(commands.get(str(item.get("chat_id") or ""), []))
+        item["suggested_prefix"] = shared or command
+
+
+def _trust_shell_pattern(services: Services, pattern: str) -> None:
+    """Add a trusted shell command or prefix (``...*``) for future runs."""
+    values = list(services.prefs.get("trusted_shell_commands") or [])
+    if pattern in values:
+        return
+    values.append(pattern)
+    services.prefs.update({"trusted_shell_commands": values[-200:]})
+    services.audit.log("user", "trusted_shell_prefix", pattern)
 
 
 def _remember_shell_command(services: Services, approval: Dict[str, Any]) -> None:
@@ -1151,6 +1189,7 @@ async def list_approvals(
         "trusted_hosts": services.trust.list(),
         "vault": services.vault.status(),
     }
+    _annotate_shell_prefixes(data["pending"])
     if trusted:
         commands = services.prefs.get("trusted_shell_commands") or []
         families = list(services.prefs.get("trusted_shell_families") or [])
@@ -1192,10 +1231,34 @@ async def approve(
         raise HTTPException(
             400, "This action is not tied to a browser host, so it can only be approved once."
         )
+    trust_pattern = ""
+    if scope == "command":
+        if approval.get("tool") != "run_shell":
+            raise HTTPException(
+                400, "Only shell approvals can be trusted by command prefix."
+            )
+        command = " ".join(
+            str((approval.get("args") or {}).get("command") or "").split()
+        )
+        trust_pattern = " ".join(str(payload.pattern or "").split()) if payload else ""
+        if not command or not trust_pattern:
+            raise HTTPException(400, "A command prefix is required.")
+        if trust_pattern.endswith("*"):
+            base = trust_pattern[:-1].strip()
+            if not base or not command.startswith(base):
+                raise HTTPException(
+                    400, "That prefix does not match the command being approved."
+                )
+        elif command != trust_pattern:
+            raise HTTPException(
+                400, "That prefix does not match the command being approved."
+            )
     if not services.approvals.claim(approval_id):
         raise HTTPException(409, "This approval is already being handled.")
     if scope == "host":
         services.trust.trust(approval["host"])
+    if trust_pattern:
+        _trust_shell_pattern(services, trust_pattern)
 
     result = await execute_approved(services, approval)
     _remember_shell_command(services, approval)
@@ -1224,6 +1287,8 @@ async def approve(
                     " Trusted %s for future browser actions."
                     % approval["host"]
                     if scope == "host"
+                    else " Trusted shell commands starting with: %s" % trust_pattern
+                    if trust_pattern
                     else ""
                 ),
             ),
@@ -1255,6 +1320,7 @@ async def approve(
         "followup": followup,
         "followup_error": followup_error,
         "trusted_hosts": services.trust.list(),
+        "trusted_shell_pattern": trust_pattern,
     }
 
 

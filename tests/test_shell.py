@@ -222,3 +222,90 @@ async def test_shell_cwd_cannot_escape_workspace(settings):
     with pytest.raises(ShellError):
         resolve_cwd(settings, "../outside")
     assert resolve_cwd(settings, "") == settings.shell_workspace.resolve()
+
+def test_shell_trusted_prefix_finds_the_shared_part():
+    from app.shell import shell_trusted_prefix
+
+    first = "ssh -F /workspace/.ssh/config raspi-muse 'date; echo hi'"
+    second = "ssh -F /workspace/.ssh/config raspi-muse 'ls -l /tmp'"
+    assert (
+        shell_trusted_prefix([first, second])
+        == "ssh -F /workspace/.ssh/config raspi-muse*"
+    )
+    assert shell_trusted_prefix([first]) == ""
+    assert shell_trusted_prefix(["ls", "cat"]) == ""
+
+
+async def test_prefix_approval_trusts_similar_shell_commands(app, auth_client):
+    services = app.state.services
+    services.prefs.update({"shell_enabled": True, "write_enabled": True})
+    command = "python3 -c \"print('prefix')\" /data"
+    first = await execute_tool(
+        services, "run_shell", {"command": command}, chat_id="shell-prefix"
+    )
+    assert first["status"] == "pending_approval"
+
+    approved = auth_client.post(
+        "/api/approvals/%d/approve" % first["approval_id"],
+        json={"scope": "command", "pattern": "python3 -c*"},
+        headers={"X-Muse-Request": "1"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert "python3 -c*" in (services.prefs.get("trusted_shell_commands") or [])
+
+    variant = await execute_tool(
+        services,
+        "run_shell",
+        {"command": "python3 -c \"print('other')\""},
+        chat_id="shell-prefix",
+    )
+    assert variant.get("status") is None
+    assert variant["ok"] is True
+    assert services.approvals.pending() == []
+
+
+async def test_prefix_approval_must_match_the_command(app, auth_client):
+    services = app.state.services
+    services.prefs.update({"shell_enabled": True, "write_enabled": True})
+    first = await execute_tool(
+        services,
+        "run_shell",
+        {"command": "python3 -c \"print('bad')\" /data"},
+        chat_id="shell-prefix-bad",
+    )
+    assert first["status"] == "pending_approval"
+
+    rejected = auth_client.post(
+        "/api/approvals/%d/approve" % first["approval_id"],
+        json={"scope": "command", "pattern": "rm -rf*"},
+        headers={"X-Muse-Request": "1"},
+    )
+    assert rejected.status_code == 400
+    assert any(
+        item["id"] == first["approval_id"] for item in services.approvals.pending()
+    )
+
+
+async def test_pending_shell_approvals_suggest_a_shared_prefix(app, auth_client):
+    services = app.state.services
+    services.prefs.update({"shell_enabled": True, "write_enabled": True})
+    first = await execute_tool(
+        services,
+        "run_shell",
+        {"command": "python3 -c \"print(1)\" /data"},
+        chat_id="shell-suggest",
+    )
+    second = await execute_tool(
+        services,
+        "run_shell",
+        {"command": "python3 -c \"print(2)\" /data"},
+        chat_id="shell-suggest",
+    )
+    assert first["status"] == "pending_approval"
+    assert second["status"] == "pending_approval"
+
+    data = auth_client.get("/api/approvals").json()
+    pending = {item["id"]: item for item in data["pending"]}
+    assert pending[first["approval_id"]]["suggested_prefix"] == "python3 -c*"
+    assert pending[second["approval_id"]]["suggested_prefix"] == "python3 -c*"
+

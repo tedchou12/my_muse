@@ -1921,7 +1921,11 @@ async def execute_tool(
             )
         signature = shell_command_signature(command)
         legacy = " ".join(command.split())
-        trusted_hit = signature in trusted or legacy in trusted
+        trusted_hit = (
+            signature in trusted
+            or legacy in trusted
+            or _agent_command_trusted(command, trusted)
+        )
         reason = shell_approval_reason(command)
         family = shell_command_family(command)
         family_hit = bool(family and family in families and reason == "download")
@@ -1966,6 +1970,11 @@ async def execute_tool(
             "tool": name,
             "host": host,
             "summary": summary,
+            "suggested_prefix": (
+                " ".join(str(args.get("command") or "").split())
+                if name == "run_shell"
+                else ""
+            ),
             "message": (
                 "Approval requested: %s%s. The user must approve it in the "
                 "Approvals inbox. Do not retry."

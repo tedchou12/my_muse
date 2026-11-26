@@ -525,6 +525,15 @@ work that does not fit the browser UI. It is **off by default**. Turn it on in
   command also trusts all later `curl` variations until you revoke the family.
   Manage or revoke remembered commands under
   **Approvals → Trusted shell commands**.
+- **Trust a prefix instead of every variant.** Shell approval cards have a
+  **Trust prefix…** button: it runs the command and remembers a prefix ending in
+  `*` (for example `ssh -F /workspace/.ssh/config raspi-muse*`), so later
+  commands that start with it run without asking. When several similar
+  approvals are pending, the suggested prefix is the longest shared prefix of
+  those commands; otherwise it pre-fills the exact command so you can add `*`.
+  Entries ending in `*` are prefix matches; plain entries stay exact matches.
+  The button is deliberately explicit (prompt + confirmation) because it grants
+  future commands, and everything stays revocable in the same list.
 - `/tmp`, `/var/tmp`, `/dev/null`, `/dev/stdout`, and `/dev/stderr` are treated
   as scratch paths. `~` and `$HOME` point at `/workspace` and are also treated
   as scratch. Other paths outside `/workspace` still need approval.
