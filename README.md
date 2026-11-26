@@ -965,7 +965,10 @@ Deliberately out of scope for v0.1:
   agent's scope, so its notes and skills follow it into its automations.
   Everything is visible and editable (including memory deletion) in
   Settings → Team, where each bot card and the team-lead card show a
-  Memory & skills panel.
+  Memory & skills panel. The panel element is kept across poller refreshes
+  (only counters update in place), open panels are remembered in the browser,
+  and static assets are build-stamped (`?v=<build>`) so a reload can never mix
+  an old `app.js` with fresh HTML.
 - **Scheduled tasks carry their context.** When you schedule a task, the last
   few chat turns are stored with it and injected into the prompt when it fires,
   so an automation does not depend on chat memory it cannot see.
