@@ -547,6 +547,21 @@ def test_static_assets_revalidate(auth_client):
     assert response.headers.get("cache-control") == "no-cache"
 
 
+def test_index_stamps_the_build_and_session_reports_it(client):
+    from app import BUILD
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert page.headers.get("cache-control") == "no-store"
+    assert "__BUILD__" not in page.text
+    assert "/static/app.js?v=%s" % BUILD in page.text
+    assert "/static/styles.css?v=%s" % BUILD in page.text
+    assert 'name="muse-build" content="%s"' % BUILD in page.text
+
+    session = client.get("/api/session").json()
+    assert session["build"] == BUILD
+
+
 def test_csp_ignores_unsafe_frame_values(settings):
     settings.browser_vnc_url = "javascript:alert(1)"
     settings.csp_frame_src = "*, data:text/html,http://ok.example:6080/path"

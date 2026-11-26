@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import __version__
+from . import BUILD, __version__
 from .agent import Agent, AgentError
 from .approvals import ApprovalError
 from .browser import BrowserError, BrowserUnavailable
@@ -412,6 +412,7 @@ async def session_info(
     data: Dict[str, Any] = {
         "authenticated": authenticated,
         "version": __version__,
+        "build": BUILD,
         "openai_configured": services.openai.configured,
     }
     if authenticated:

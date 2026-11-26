@@ -12,10 +12,10 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import BUILD, __version__
 from .agent import Agent
 from .api import router
 from .approvals import ApprovalQueue
@@ -298,7 +298,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(str(STATIC_DIR / "index.html"))
+    async def index() -> HTMLResponse:
+        # Stamp the asset URLs with the build so a reload can never serve a
+        # stale app.js next to fresh HTML.
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8").replace(
+            "__BUILD__", BUILD
+        )
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     return app

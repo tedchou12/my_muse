@@ -34,7 +34,10 @@ const state = {
   renderedChatId: null,
   renderedChat: {},
   echoes: {},
-  teamSignature: null,
+  scopePanels: {},
+  teamShape: null,
+  teamLive: null,
+  teamTasks: null,
   chatTimer: null,
   provider: null,
   providerPreset: null,
@@ -377,8 +380,19 @@ function enterApp(session) {
   renderAgentNav();
   refreshBadges();
   startChatUpdatesPolling();
+  checkBundleBuild(session);
   if (!state.badgeTimer) {
     state.badgeTimer = setInterval(refreshBadges, 20000);
+  }
+}
+
+function checkBundleBuild(session) {
+  const meta = document.querySelector('meta[name="muse-build"]');
+  const loaded = meta ? meta.getAttribute("content") || "" : "";
+  const served = session && session.build ? String(session.build) : "";
+  if (!loaded || !served || loaded === "__BUILD__") return;
+  if (loaded !== served) {
+    toast("Muse was updated — reload the page to get the new version.");
   }
 }
 
@@ -1693,40 +1707,62 @@ async function onTaskAction(event) {
 }
 
 /* --------------------------------------------------------------- team */
-function teamSignature(data) {
-  const agents = (data.agents || []).map((agent) =>
-    [
+function teamShapeSignature(lead, agents) {
+  return JSON.stringify([
+    (agents || []).map((agent) => [
       agent.id,
       agent.name,
       agent.role,
       agent.status,
       agent.model,
       agent.trusted_commands,
-      agent.memory_count,
-      agent.skill_count,
-      agent.open_tasks,
-      agent.done_tasks,
-    ].join("|")
-  );
-  const tasks = (data.tasks || []).map((task) =>
-    [task.id, task.status, task.run_count, task.agent_id].join("|")
-  );
-  const messages = (data.messages || []).map((item) => item.id);
-  const lead = data.lead
-    ? [data.lead.name, data.lead.memory_count, data.lead.skill_count]
-    : [];
-  return JSON.stringify([agents, tasks, messages, lead]);
+    ]),
+    lead ? [lead.name] : [],
+  ]);
 }
 
-function reopenScopePanels(owners) {
-  owners.forEach((owner) => {
-    const panel = document.querySelector(
-      'details.scope-panel[data-owner="' + owner + '"]'
+function teamLiveSignature(lead, agents) {
+  return JSON.stringify([
+    (agents || []).map((agent) => [
+      agent.open_tasks,
+      agent.done_tasks,
+      agent.memory_count,
+      agent.skill_count,
+    ]),
+    lead ? [lead.memory_count, lead.skill_count] : [],
+  ]);
+}
+
+function teamTasksSignature(tasks) {
+  return JSON.stringify(
+    (tasks || []).map((task) => [
+      task.id,
+      task.status,
+      task.run_count,
+      task.agent_id,
+    ])
+  );
+}
+
+function updateTeamLive(lead, agents) {
+  (agents || []).forEach((agent) => {
+    const meta = document.querySelector(
+      '[data-live-meta="' + agent.id + '"]'
     );
-    if (!panel) return;
-    panel.open = true;
-    if (panel.dataset.loaded !== "1") loadScopePanel(panel);
+    if (meta) {
+      meta.textContent =
+        (agent.role || "No role") +
+        " · " +
+        (agent.open_tasks || 0) +
+        " open · " +
+        (agent.done_tasks || 0) +
+        " done";
+    }
+    updateScopePanelCounts(agent.id, agent.memory_count, agent.skill_count);
   });
+  if (lead) {
+    updateScopePanelCounts("lead", lead.memory_count, lead.skill_count);
+  }
 }
 
 async function loadTeam() {
@@ -1736,30 +1772,42 @@ async function loadTeam() {
     state.agents = data.agents || [];
     renderAgentNav();
     loadGroups();
-    const signature = teamSignature(data);
-    const unchanged = signature === state.teamSignature;
-    state.teamSignature = signature;
-    if (unchanged && state.tab === "team") {
-      // The 5s poller must not rebuild the tab under the user: keep scroll,
-      // open panels and text selection intact when nothing changed.
-      if (state.teamTaskId) await loadTeamThread(state.teamTaskId);
-      return;
-    }
-    const openScopes = $$(
-      "#bot-list details.scope-panel, #lead-card details.scope-panel"
-    )
-      .filter((panel) => panel.open)
-      .map((panel) => panel.dataset.owner);
-    const tabEl = $("#tab-team");
-    const scrollTop = tabEl ? tabEl.scrollTop : window.scrollY;
-    renderTeamLead(data.lead || null);
-    renderTeamAgents(data.agents || []);
-    renderTeamTasks(data.tasks || []);
-    reopenScopePanels(openScopes);
-    if (tabEl) {
-      tabEl.scrollTop = scrollTop;
-    } else {
-      window.scrollTo(0, scrollTop);
+    const lead = data.lead || null;
+    const agents = data.agents || [];
+    const shape = teamShapeSignature(lead, agents);
+    const live = teamLiveSignature(lead, agents);
+    const tasksSig = teamTasksSignature(data.tasks || []);
+    const structural = shape !== state.teamShape;
+    const liveChanged = live !== state.teamLive;
+    const tasksChanged = tasksSig !== state.teamTasks;
+    state.teamShape = shape;
+    state.teamLive = live;
+    state.teamTasks = tasksSig;
+    if (structural) {
+      const tabEl = $("#tab-team");
+      const scrollTop = tabEl ? tabEl.scrollTop : window.scrollY;
+      renderTeamCards(lead, agents);
+      renderTeamTasks(data.tasks || []);
+      restoreOpenScopes();
+      if (tabEl) {
+        window.requestAnimationFrame(() => {
+          tabEl.scrollTop = scrollTop;
+        });
+      }
+    } else if (liveChanged || tasksChanged) {
+      // The poller only patches numbers; it never rebuilds the cards, so an
+      // expanded Memory/Skills panel cannot be closed under the user.
+      updateTeamLive(lead, agents);
+      if (tasksChanged) {
+        const tabEl = $("#tab-team");
+        const scrollTop = tabEl ? tabEl.scrollTop : 0;
+        renderTeamTasks(data.tasks || []);
+        if (tabEl) {
+          window.requestAnimationFrame(() => {
+            tabEl.scrollTop = scrollTop;
+          });
+        }
+      }
     }
     if (state.teamTaskId) {
       await loadTeamThread(state.teamTaskId);
@@ -1792,26 +1840,76 @@ function parseTrustedCommands(raw) {
   return [];
 }
 
-function scopePanelHtml(owner, memoryCount, skillCount) {
-  return (
-    '<details class="scope-panel" data-owner="' +
-    esc(owner) +
-    '"><summary>Memory (' +
-    esc(memoryCount || 0) +
-    ") · Skills (" +
-    esc(skillCount || 0) +
-    ')</summary><div class="scope-body"><div class="muted small">Loading…</div></div></details>'
-  );
-}
-
-function bindScopePanels(root) {
-  if (!root) return;
-  root.querySelectorAll("details.scope-panel").forEach((panel) => {
-    if (panel.dataset.bound === "1") return;
-    panel.dataset.bound = "1";
+function getScopePanel(owner) {
+  const key = String(owner);
+  if (!state.scopePanels[key]) {
+    const panel = document.createElement("details");
+    panel.className = "scope-panel";
+    panel.dataset.owner = key;
+    panel.innerHTML =
+      '<summary>Memory (0) · Skills (0)</summary>' +
+      '<div class="scope-body"><div class="muted small">Loading…</div></div>';
     panel.addEventListener("toggle", () => {
       if (panel.open && panel.dataset.loaded !== "1") loadScopePanel(panel);
+      saveOpenScopes();
     });
+    state.scopePanels[key] = panel;
+  }
+  return state.scopePanels[key];
+}
+
+function mountScopePanels(root) {
+  if (!root) return;
+  root.querySelectorAll(".scope-host").forEach((host) => {
+    const owner = host.dataset.owner;
+    if (!owner) return;
+    const panel = getScopePanel(owner);
+    // Re-use the same <details> node so an expanded panel keeps its open state
+    // and its loaded content across card re-renders.
+    host.replaceChildren(panel);
+    if (panel.open && panel.dataset.loaded !== "1") loadScopePanel(panel);
+  });
+}
+
+function updateScopePanelCounts(owner, memoryCount, skillCount) {
+  const panel = state.scopePanels[String(owner)];
+  if (!panel) return;
+  if (panel.open && panel.dataset.loaded === "1") return; // content is fresher
+  const summary = panel.querySelector("summary");
+  if (summary) {
+    summary.textContent =
+      "Memory (" +
+      (memoryCount || 0) +
+      ") · Skills (" +
+      (skillCount || 0) +
+      ")";
+  }
+}
+
+function saveOpenScopes() {
+  try {
+    const owners = Object.keys(state.scopePanels).filter((owner) => {
+      const panel = state.scopePanels[owner];
+      return panel.open && document.body.contains(panel);
+    });
+    window.localStorage.setItem("muse.scopeOpen", JSON.stringify(owners));
+  } catch (error) {
+    /* storage is optional */
+  }
+}
+
+function restoreOpenScopes() {
+  let owners = [];
+  try {
+    owners = JSON.parse(window.localStorage.getItem("muse.scopeOpen") || "[]");
+  } catch (error) {
+    owners = [];
+  }
+  (owners || []).forEach((owner) => {
+    const panel = state.scopePanels[String(owner)];
+    if (!panel) return;
+    panel.open = true;
+    if (panel.dataset.loaded !== "1") loadScopePanel(panel);
   });
 }
 
@@ -1984,24 +2082,19 @@ async function onScopeAdd(event) {
   }
 }
 
-function renderTeamLead(lead) {
-  const list = $("#lead-card");
-  if (!list) return;
-  if (!lead) {
-    list.innerHTML = "";
-    return;
+function renderTeamCards(lead, agents) {
+  const leadList = $("#lead-card");
+  if (leadList) {
+    leadList.innerHTML = lead
+      ? '<div class="item"><div class="grow"><h4>' +
+        esc(lead.name || "Team lead") +
+        ' <span class="badge">lead</span></h4>' +
+        '<div class="meta">Owns the main chat and the shared task board. Memory and skills here are private to the lead; only the lead can read other agents\' notes.</div>' +
+        '<div class="scope-host" data-owner="lead"></div>' +
+        "</div></div>"
+      : "";
+    mountScopePanels(leadList);
   }
-  list.innerHTML =
-    '<div class="item"><div class="grow"><h4>' +
-    esc(lead.name || "Team lead") +
-    ' <span class="badge">lead</span></h4>' +
-    '<div class="meta">Owns the main chat and the shared task board. Memory and skills here are private to the lead; only the lead can read other agents\' notes.</div>' +
-    scopePanelHtml("lead", lead.memory_count, lead.skill_count) +
-    "</div></div>";
-  bindScopePanels(list);
-}
-
-function renderTeamAgents(agents) {
   const list = $("#bot-list");
   list.innerHTML = agents.length
     ? agents
@@ -2023,17 +2116,21 @@ function renderTeamAgents(agents) {
               ? ' <span class="badge" title="Trusted shell commands">trust ' + trust.length + "</span>"
               : "") +
             "</h4>" +
-            '<div class="meta">' +
+            '<div class="meta"><span data-live-meta="' +
+            esc(agent.id) +
+            '">' +
             esc(agent.role || "No role") +
             " · " +
             esc(agent.open_tasks) +
             " open · " +
             esc(agent.done_tasks) +
-            " done</div>" +
+            " done</span></div>" +
             '<pre class="detail">' +
             esc((agent.instructions || "").slice(0, 500)) +
             "</pre>" +
-            scopePanelHtml(agent.id, agent.memory_count, agent.skill_count) +
+            '<div class="scope-host" data-owner="' +
+            esc(agent.id) +
+            '"></div>' +
             "</div>" +
             '<div class="controls">' +
             (agent.status === "active"
@@ -2065,6 +2162,7 @@ function renderTeamAgents(agents) {
         })
         .join("")
     : '<div class="card muted">No bots yet. Describe one above and Muse will design its role.</div>';
+  mountScopePanels(list);
 
   const select = $("#team-agent");
   const current = select.value;
@@ -2086,7 +2184,7 @@ function renderTeamAgents(agents) {
   if (current && active.some((agent) => String(agent.id) === current)) {
     select.value = current;
   }
-  bindScopePanels(list);
+  updateTeamLive(lead, agents);
 }
 
 function renderTeamTasks(tasks) {
